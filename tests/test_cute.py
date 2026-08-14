@@ -58,6 +58,57 @@ def test_cute_register_roundtrip():
         quants.register_dequant(QTYPE, original, override=True)
 
 
+def _random_finite_q4k(n_rows, k_dim, seed):
+    """Random Q4_K blocks with finite (small) d/dmin, byte-shaped (n_rows, row_bytes)."""
+    rng = np.random.default_rng(seed)
+    nb = n_rows * k_dim // 256
+    data = rng.integers(0, 256, size=(nb, 144), dtype=np.uint8)
+    data[:, :4] = (rng.normal(size=(nb, 2)) * 0.05).astype(np.float16).view(np.uint8)
+    return data.reshape(n_rows, -1)
+
+
+@pytest.mark.parametrize("m", [1, 3, 8])
+def test_cute_matmul_q4_k(m):
+    n_rows, k_dim = 256, 1536
+    data = _random_finite_q4k(n_rows, k_dim, seed=m)
+    w = gguf_jax.QuantizedArray.from_bytes(data, QTYPE, shape=(n_rows, k_dim))
+    rng = np.random.default_rng(m + 100)
+    x = jnp.asarray(rng.normal(size=(m, k_dim)), dtype=jnp.bfloat16)
+
+    y = np.asarray(cute_mod.matmul_q4_k(x, w), dtype=np.float32)
+
+    wd = jnp.asarray(gguf.quants.dequantize(data, QTYPE)).astype(jnp.bfloat16)
+    ref = np.asarray(
+        (x.astype(jnp.float32) @ wd.astype(jnp.float32).T).astype(jnp.bfloat16),
+        dtype=np.float32)
+    # identical products, f32 accumulation in a different order, one bf16 round
+    np.testing.assert_allclose(y, ref, rtol=1e-2, atol=1e-2 * np.abs(ref).max())
+
+
+def test_cute_matmul_q4_k_batch_and_fallback():
+    n_rows, k_dim = 256, 512
+    data = _random_finite_q4k(n_rows, k_dim, seed=42)
+    w = gguf_jax.QuantizedArray.from_bytes(data, QTYPE, shape=(n_rows, k_dim))
+    rng = np.random.default_rng(0)
+
+    # 3D batch, kernel path
+    x = jnp.asarray(rng.normal(size=(2, 3, k_dim)), dtype=jnp.bfloat16)
+    y = cute_mod.matmul_q4_k(x, w)
+    assert y.shape == (2, 3, n_rows) and y.dtype == jnp.bfloat16
+
+    # beyond the M cap: falls back to dequantize-then-matmul
+    xl = jnp.asarray(rng.normal(size=(32, k_dim)), dtype=jnp.bfloat16)
+    yl = np.asarray(cute_mod.matmul_q4_k(xl, w), dtype=np.float32)
+    wd = jnp.asarray(gguf.quants.dequantize(data, QTYPE)).astype(jnp.bfloat16)
+    ref = np.asarray((xl @ wd.T), dtype=np.float32)
+    np.testing.assert_allclose(yl, ref, rtol=1e-2, atol=1e-2 * np.abs(ref).max())
+
+    # jit-compatible (QuantizedArray is a pytree)
+    yj = jax.jit(cute_mod.matmul_q4_k)(x, w)
+    np.testing.assert_array_equal(
+        np.asarray(y).view(np.uint16), np.asarray(yj).view(np.uint16))
+
+
 def test_cute_bf16_output_matches_cast():
     data = random_bytes(QTYPE, (4, 512), seed=8)
     via_cute = cute_mod.dequantize_q4_k(jnp.asarray(data), dtype=jnp.bfloat16)

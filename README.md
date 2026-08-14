@@ -101,9 +101,31 @@ dequantize only, effective bandwidth = bytes in + out over wall time):
 | pure XLA    | 468 µs, 572 GB/s   | 274 µs, 549 GB/s   |
 | cute Q4_K   | 433 µs, 619 GB/s   | 224 µs, 671 GB/s   |
 
-The remaining headroom (~896 GB/s peak) is scattered small stores; fused
-dequant-matmul, where the dense matrix never reaches HBM at all, is the real
-prize and the intended next step.
+The remaining headroom (~896 GB/s peak) is scattered small stores.
+
+### Fused dequant-matmul
+
+`gguf_jax.cute.matmul_q4_k(x, w)` computes `x @ w.T` (`x` bfloat16
+`(..., K)`, `w` a Q4_K `QuantizedArray` `(N, K)`) with the weights
+dequantized in registers — the dense matrix never touches HBM. One warp per
+output row; weights are rounded through bfloat16 in-register, so values match
+`x @ w.dequantize(bfloat16).T` up to f32 summation order (~1 ulp of bf16).
+The kernel specializes per flattened batch size M and falls back to
+dequantize-then-matmul above M = 8, where the unfused path wins anyway.
+
+`bench/bench_matmul.py`, same 4096×14336 weight (33MB quantized, 117MB
+dense):
+
+| M  | fused    | unfused    | dense bf16 matmul |
+|----|----------|------------|-------------------|
+| 1  |  76 µs   | 383 µs     | 150 µs            |
+| 2  |  84 µs   | 381 µs     | 149 µs            |
+| 4  | 158 µs   | 385 µs     | 151 µs            |
+| 8  | 225 µs   | 379 µs     | 150 µs            |
+
+At decode shapes (M ≤ 2) the fused kernel is ~5× the unfused path and ~2×
+a dense bf16 matmul with the weights already resident — the quantized bytes
+are simply less memory to read.
 
 ## Development
 
