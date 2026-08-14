@@ -1,0 +1,23 @@
+[project]
+name = "gguf-jax"
+version = "0.1.0"
+description = "Load GGUF-quantized models in JAX and dequantize on the fly, bitwise-exact vs the llama.cpp reference"
+readme = "README.md"
+authors = [
+    { name = "Emily Shepperd", email = "nshepperd@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "gguf>=0.19.0",
+    "jax>=0.11.0",
+    "numpy>=2.5.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+test = [
+    "pytest>=9.1.1",
+]

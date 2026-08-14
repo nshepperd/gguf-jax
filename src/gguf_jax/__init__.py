@@ -1,0 +1,24 @@
+"""gguf-jax: load GGUF-quantized models in JAX and dequantize on the fly.
+
+Quantized tensors are held as raw uint8 block data in :class:`QuantizedArray`
+pytrees and decoded by pure-JAX kernels whose float32 output is bitwise
+identical to the ``gguf.quants`` reference implementation from llama.cpp.
+"""
+
+from gguf.constants import GGMLQuantizationType
+
+from .array import QuantizedArray, quantize
+from .loader import GGUFFile, load_gguf
+from .quants import dequantize, dequantize_blocks, register_dequant, supported_types
+
+__all__ = [
+    "GGMLQuantizationType",
+    "GGUFFile",
+    "QuantizedArray",
+    "dequantize",
+    "dequantize_blocks",
+    "load_gguf",
+    "quantize",
+    "register_dequant",
+    "supported_types",
+]
