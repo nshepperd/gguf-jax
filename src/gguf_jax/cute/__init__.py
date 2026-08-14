@@ -5,5 +5,6 @@ cutedsl-jax). Call :func:`register` to replace the pure-JAX kernels with the
 cute implementations for the qtypes that have one.
 """
 from .q4_k import dequantize_q4_k, matmul_q4_k, register
+from .q4_k_gemm import gemm_q4_k
 
-__all__ = ["dequantize_q4_k", "matmul_q4_k", "register"]
+__all__ = ["dequantize_q4_k", "gemm_q4_k", "matmul_q4_k", "register"]

@@ -67,7 +67,27 @@ def _random_finite_q4k(n_rows, k_dim, seed):
     return data.reshape(n_rows, -1)
 
 
-@pytest.mark.parametrize("m", [1, 3, 8])
+@pytest.mark.parametrize("m", [1, 5, 32, 100])
+def test_cute_gemm_q4_k(m):
+    """The tensor-core GEMM kernel, called directly."""
+    n_rows, k_dim = 256, 1536
+    data = _random_finite_q4k(n_rows, k_dim, seed=m + 50)
+    w = gguf_jax.QuantizedArray.from_bytes(data, QTYPE, shape=(n_rows, k_dim))
+    rng = np.random.default_rng(m + 500)
+    x = jnp.asarray(rng.normal(size=(m, k_dim)), dtype=jnp.bfloat16)
+
+    y = np.asarray(cute_mod.gemm_q4_k(x, w), dtype=np.float32)
+
+    wd = jnp.asarray(gguf.quants.dequantize(data, QTYPE)).astype(jnp.bfloat16)
+    ref = np.asarray(
+        (x.astype(jnp.float32) @ wd.astype(jnp.float32).T).astype(jnp.bfloat16),
+        dtype=np.float32)
+    np.testing.assert_allclose(y, ref, rtol=1e-2, atol=1e-2 * np.abs(ref).max())
+
+
+# m chosen to cover all three dispatch paths: 1-2 warp-GEMV, 3-128
+# tensor-core GEMM, >128 dequantize-then-matmul
+@pytest.mark.parametrize("m", [1, 3, 8, 200])
 def test_cute_matmul_q4_k(m):
     n_rows, k_dim = 256, 1536
     data = _random_finite_q4k(n_rows, k_dim, seed=m)

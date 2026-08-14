@@ -107,25 +107,44 @@ The remaining headroom (~896 GB/s peak) is scattered small stores.
 
 `gguf_jax.cute.matmul_q4_k(x, w)` computes `x @ w.T` (`x` bfloat16
 `(..., K)`, `w` a Q4_K `QuantizedArray` `(N, K)`) with the weights
-dequantized in registers — the dense matrix never touches HBM. One warp per
-output row; weights are rounded through bfloat16 in-register, so values match
+dequantized on the fly — the dense matrix never touches HBM. Weights are
+rounded through bfloat16 in-register, so values match
 `x @ w.dequantize(bfloat16).T` up to f32 summation order (~1 ulp of bf16).
-The kernel specializes per flattened batch size M and falls back to
-dequantize-then-matmul above M = 8, where the unfused path wins anyway.
+It dispatches on the flattened batch size M across two kernels:
+
+- **M ≤ 2 — warp-GEMV** (`q4_k.py`): one warp per output row, scalar FMA
+  against per-lane dequantized weights, butterfly-shuffle reduction.
+  Specializes per M.
+- **3 ≤ M ≤ 128 — tensor-core GEMM** (`q4_k_gemm.py`): a proper
+  `mma.sync.m16n8k16` bf16 GEMM (SM80-class atoms, runs on SM120), modeled
+  on CuTeDSL's Ampere TensorOpGemm, except the B operand flows through the
+  cp.async pipeline *quantized* (144B per row per superblock — 3.5× less
+  smem traffic) and is decoded at the smem→register stage straight into the
+  MMA B-fragments, via an identity-tensor partition that supplies each
+  fragment element's (n, k) coordinate. Tile (bM, bN, bK) = (32, 64, 256) —
+  bK is exactly one Q4_K superblock. M is dynamic: one compile serves all
+  batch sizes; requires N % 64 == 0.
+- **M > 128 — dequantize-then-matmul**: re-reading the quantized weight
+  once per 32-row M-tile stops paying; a single dequant + dense GEMM wins.
 
 `bench/bench_matmul.py`, same 4096×14336 weight (33MB quantized, 117MB
 dense):
 
-| M  | fused    | unfused    | dense bf16 matmul |
-|----|----------|------------|-------------------|
-| 1  |  76 µs   | 383 µs     | 150 µs            |
-| 2  |  84 µs   | 381 µs     | 149 µs            |
-| 4  | 158 µs   | 385 µs     | 151 µs            |
-| 8  | 225 µs   | 379 µs     | 150 µs            |
+| M   | fused (dispatch) | tc-gemm  | unfused  | dense bf16 matmul |
+|-----|------------------|----------|----------|-------------------|
+| 1   |  73 µs (gemv)    |  91 µs   | 379 µs   | 156 µs            |
+| 4   |  91 µs           |  91 µs   | 405 µs   | 147 µs            |
+| 16  |  91 µs           |  91 µs   | 389 µs   | 154 µs            |
+| 32  |  92 µs           |  92 µs   | 399 µs   | 164 µs            |
+| 64  | 188 µs           | 188 µs   | 398 µs   | 164 µs            |
+| 128 | 366 µs           | 366 µs   | 444 µs   | 198 µs            |
+| 512 | 883 µs (unfused) | 1365 µs  | 883 µs   | 643 µs            |
 
-At decode shapes (M ≤ 2) the fused kernel is ~5× the unfused path and ~2×
-a dense bf16 matmul with the weights already resident — the quantized bytes
-are simply less memory to read.
+The tensor-core path is flat at ~91 µs through M = 32 (one M-tile): 4.3×
+the unfused path, and faster than a dense bf16 matmul with resident weights
+up to M ≈ 64 — the quantized bytes are simply less memory to read. Obvious
+next lever: at large M, keep W-tile reuse across M-tiles (split-K /
+persistent CTAs) instead of falling back.
 
 ## Development
 

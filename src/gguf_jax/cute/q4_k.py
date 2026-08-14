@@ -110,10 +110,13 @@ def dequantize_q4_k(data: jax.Array, dtype=jnp.float32) -> jax.Array:
 # accumulates in float32; a butterfly-shuffle reduction folds the 32 lanes.
 # M is compile-time static (one kernel specialization per batch size).
 
-# Measured crossover on RTX 5070 Ti: the GEMV kernel wins up to M=8 (1.7x),
-# loses by M=16 (0.8x) — per-lane work scales with M while the unfused
-# path's cost is flat. Larger batches fall back to dequantize-then-matmul.
-_MATMUL_MAX_M = 8
+# Measured crossovers on RTX 5070 Ti (4096x14336 weight): the warp-GEMV
+# wins at M <= 2 (73us vs the tensor-core GEMM's flat 91us); the
+# tensor-core GEMM (q4_k_gemm.py) wins from there until ~M=160, where
+# dequantize-then-matmul takes over because it reads the quantized weight
+# once instead of once per 32-row M-tile.
+_GEMV_MAX_M = 2
+_GEMM_MAX_M = 128
 
 
 @cute.kernel
@@ -188,12 +191,16 @@ def matmul_q4_k(x: jax.Array, w) -> jax.Array:
 
     ``x`` is bfloat16 ``(..., K)``; the result is bfloat16 ``(..., N)``.
     Weights are dequantized in registers (rounded through bfloat16, so values
-    match ``x @ w.dequantize(bfloat16).T`` up to summation order) and never
-    materialized. The kernel specializes per flattened batch size M; above
-    ``M = 16`` it falls back to dequantize-then-matmul, which wins there
-    anyway.
+    match ``x @ w.dequantize(bfloat16).T`` up to f32 summation order) and
+    never materialized. Dispatches on the flattened batch size M: warp-GEMV
+    for decode shapes, the tensor-core GEMM for small-batch/prefill, and
+    dequantize-then-matmul for large M where re-reading the quantized weight
+    per M-tile stops paying.
     """
     from gguf_jax.array import QuantizedArray
+
+    from .q4_k_gemm import _BN as _GEMM_BN
+    from .q4_k_gemm import gemm_q4_k
 
     assert isinstance(w, QuantizedArray) and w.qtype == GGMLQuantizationType.Q4_K
     assert len(w.shape) == 2, "w must be a 2D weight"
@@ -203,9 +210,7 @@ def matmul_q4_k(x: jax.Array, w) -> jax.Array:
 
     xm = x.reshape(-1, k_dim)
     m = xm.shape[0]
-    if m > _MATMUL_MAX_M:
-        out = xm @ w.dequantize(jnp.bfloat16).T
-    else:
+    if m <= _GEMV_MAX_M:
         out = cutejax.call(
             _q4_k_matmul_launch,
             jax.ShapeDtypeStruct((m, n_rows), jnp.bfloat16),
@@ -213,6 +218,10 @@ def matmul_q4_k(x: jax.Array, w) -> jax.Array:
             in_specs=[None, cutejax.ArraySpec(static_dims=(0,))],
             out_specs=cutejax.ArraySpec(static_dims=(0,)),
         )
+    elif m <= _GEMM_MAX_M and n_rows % _GEMM_BN == 0:
+        out = gemm_q4_k(xm, w)
+    else:
+        out = xm @ w.dequantize(jnp.bfloat16).T
     return out.reshape(*x.shape[:-1], n_rows)
 
 

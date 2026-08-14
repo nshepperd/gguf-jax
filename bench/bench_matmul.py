@@ -38,20 +38,24 @@ def main():
         data.reshape(N, -1), GGMLQuantizationType.Q4_K, shape=(N, K))
     w_bytes = data.nbytes
 
-    fused = jax.jit(matmul_q4_k)
+    from gguf_jax.cute import gemm_q4_k
+
+    fused = jax.jit(matmul_q4_k)          # dispatching wrapper
+    gemm = jax.jit(gemm_q4_k)             # tensor-core GEMM, forced
     unfused = jax.jit(lambda x, w: x @ w.dequantize(jnp.bfloat16).T)
     dense_w = w.dequantize(jnp.bfloat16)
     dense = jax.jit(lambda x, wd: x @ wd.T)
 
     print(f"device: {jax.devices()[0].device_kind}, W: {N}x{K} Q4_K "
           f"({w_bytes/1e6:.0f}MB quantized, {N*K*2/1e6:.0f}MB as bf16)")
-    print(f"{'M':>4} {'fused':>9} {'unfused':>9} {'dense bf16':>10}   speedup")
-    for m in [1, 2, 4, 8, 16]:
+    print(f"{'M':>4} {'fused':>9} {'tc-gemm':>9} {'unfused':>9} {'dense bf16':>10}   speedup")
+    for m in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]:
         x = jnp.asarray(rng.normal(size=(m, K)), dtype=jnp.bfloat16)
         t_fused = bench(fused, x, w)
+        t_gemm = bench(gemm, x, w)
         t_unfused = bench(unfused, x, w)
         t_dense = bench(dense, x, dense_w)
-        print(f"{m:>4} {t_fused*1e6:>7.0f}us {t_unfused*1e6:>7.0f}us "
+        print(f"{m:>4} {t_fused*1e6:>7.0f}us {t_gemm*1e6:>7.0f}us {t_unfused*1e6:>7.0f}us "
               f"{t_dense*1e6:>8.0f}us   {t_unfused/t_fused:>5.1f}x")
 
 
