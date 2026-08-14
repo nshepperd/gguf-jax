@@ -92,5 +92,8 @@ everything else (`QuantizedArray`, loader, tests) is unchanged.
 
 ```bash
 uv sync
-uv run pytest
+XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async XLA_PYTHON_CLIENT_MEM_FRACTION=0.2 uv run pytest
 ```
+
+The test group pulls in `jax[cuda13]`; the allocator env vars keep JAX from
+grabbing most of the VRAM up front.
