@@ -85,6 +85,28 @@ def test_cute_gemm_q4_k(m):
     np.testing.assert_allclose(y, ref, rtol=1e-2, atol=1e-2 * np.abs(ref).max())
 
 
+def test_cute_matmul_force_fused():
+    """force_fused keeps the tensor-core kernel beyond the M=128 crossover."""
+    n_rows, k_dim = 256, 1024
+    data = _random_finite_q4k(n_rows, k_dim, seed=77)
+    w = gguf_jax.QuantizedArray.from_bytes(data, QTYPE, shape=(n_rows, k_dim))
+    rng = np.random.default_rng(77)
+    x = jnp.asarray(rng.normal(size=(200, k_dim)), dtype=jnp.bfloat16)
+
+    y = np.asarray(cute_mod.matmul_q4_k(x, w, force_fused=True), dtype=np.float32)
+    wd = jnp.asarray(gguf.quants.dequantize(data, QTYPE)).astype(jnp.bfloat16)
+    ref = np.asarray(
+        (x.astype(jnp.float32) @ wd.astype(jnp.float32).T).astype(jnp.bfloat16),
+        dtype=np.float32)
+    np.testing.assert_allclose(y, ref, rtol=1e-2, atol=1e-2 * np.abs(ref).max())
+
+    # N not a multiple of 64 cannot honor force_fused above the GEMV range
+    w_odd = gguf_jax.QuantizedArray.from_bytes(
+        _random_finite_q4k(96, k_dim, seed=78), QTYPE, shape=(96, k_dim))
+    with pytest.raises(ValueError, match="force_fused"):
+        cute_mod.matmul_q4_k(x, w_odd, force_fused=True)
+
+
 # m chosen to cover all three dispatch paths: 1-2 warp-GEMV, 3-128
 # tensor-core GEMM, >128 dequantize-then-matmul
 @pytest.mark.parametrize("m", [1, 3, 8, 200])

@@ -127,6 +127,12 @@ It dispatches on the flattened batch size M across two kernels:
 - **M > 128 — dequantize-then-matmul**: re-reading the quantized weight
   once per 32-row M-tile stops paying; a single dequant + dense GEMM wins.
 
+`matmul_q4_k(x, w, force_fused=True)` forbids that last fallback and keeps
+the tensor-core kernel for every M, so the dense bf16 weight (2·N·K bytes)
+is never materialized — useful when the weight is large and memory is the
+constraint. Costs ~1.5× at M=512 vs the fallback; requires N % 64 == 0
+above the GEMV range.
+
 `bench/bench_matmul.py`, same 4096×14336 weight (33MB quantized, 117MB
 dense):
 

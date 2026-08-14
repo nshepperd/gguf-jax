@@ -186,7 +186,7 @@ def _q4_k_matmul_launch(stream, gU: cute.Tensor, gX: cute.Tensor, gO: cute.Tenso
         grid=[n_cta, 1, 1], block=[_CTA, 1, 1], stream=stream)
 
 
-def matmul_q4_k(x: jax.Array, w) -> jax.Array:
+def matmul_q4_k(x: jax.Array, w, *, force_fused: bool = False) -> jax.Array:
     """``x @ w.T`` with ``w`` a Q4_K :class:`~gguf_jax.QuantizedArray` (N, K).
 
     ``x`` is bfloat16 ``(..., K)``; the result is bfloat16 ``(..., N)``.
@@ -196,6 +196,13 @@ def matmul_q4_k(x: jax.Array, w) -> jax.Array:
     for decode shapes, the tensor-core GEMM for small-batch/prefill, and
     dequantize-then-matmul for large M where re-reading the quantized weight
     per M-tile stops paying.
+
+    ``force_fused=True`` forbids the dequantize fallback: the tensor-core
+    GEMM handles every M, so the dense bf16 weight (2 * N * K bytes) is never
+    materialized — the point when the weight is large. Costs speed at large M
+    (measured ~1.5x slower than the fallback at M=512 on an RTX 5070 Ti,
+    because each 32-row M-tile re-reads the quantized weight). Requires
+    ``N % 64 == 0`` when M > 2.
     """
     from gguf_jax.array import QuantizedArray
 
@@ -218,8 +225,12 @@ def matmul_q4_k(x: jax.Array, w) -> jax.Array:
             in_specs=[None, cutejax.ArraySpec(static_dims=(0,))],
             out_specs=cutejax.ArraySpec(static_dims=(0,)),
         )
-    elif m <= _GEMM_MAX_M and n_rows % _GEMM_BN == 0:
+    elif (m <= _GEMM_MAX_M or force_fused) and n_rows % _GEMM_BN == 0:
         out = gemm_q4_k(xm, w)
+    elif force_fused:
+        raise ValueError(
+            f"force_fused matmul with M={m} > {_GEMV_MAX_M} needs the tensor-core "
+            f"kernel, which requires N % {_GEMM_BN} == 0 (got N={n_rows})")
     else:
         out = xm @ w.dequantize(jnp.bfloat16).T
     return out.reshape(*x.shape[:-1], n_rows)
