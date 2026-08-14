@@ -18,7 +18,15 @@ requires = ["uv_build>=0.12.0,<0.13.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
+cute = [
+    "cutedsl-jax",
+    "jax-tvm-ffi>=0.1.3",
+    "nvidia-cutlass-dsl[cu13]>=4.7.0",
+]
 test = [
     "jax[cuda13]>=0.11.0",
     "pytest>=9.1.1",
 ]
+
+[tool.uv.sources]
+cutedsl-jax = { path = "/home/em/Dev/neural/cutedsl-jax", editable = true }

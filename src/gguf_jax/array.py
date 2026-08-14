@@ -79,8 +79,7 @@ class QuantizedArray:
             if self.qtype in _INTEGER_TYPES:
                 return out
             return out.astype(dtype)
-        out = quants.dequantize(self.data, self.qtype).reshape(self.shape)
-        return out.astype(dtype)
+        return quants.dequantize(self.data, self.qtype, dtype).reshape(self.shape)
 
     def __repr__(self) -> str:
         return (f"QuantizedArray({self.qtype.name}, shape={self.shape}, "

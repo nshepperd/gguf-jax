@@ -73,20 +73,37 @@ Two implementation notes for exactness:
 - XLA:CPU compiles with flush-to-zero, so the MXFP4 kernel constructs exact
   subnormal results with integer ops when the E8M0 scale is subnormal.
 
-## Faster kernels later
+## CuTe DSL kernels
 
 The pure-JAX kernels are the reference path: dequantization is expressed as
-plain XLA ops (bit twiddling + gathers + multiplies), which fuse reasonably
-but materialize the dequantized matrix. The intended upgrade path is fused
-dequant(-matmul) kernels written in CuTe DSL via
-[cutejax](https://github.com/nshepperd/cutejax): implement a kernel with the
-same blocks-in/floats-out contract and swap it in with
+plain XLA ops (bit twiddling + gathers + multiplies). Registered kernels have
+the contract `fn(blocks_u8, dtype) -> dtype[n_blocks, block_size]` — the
+bitwise-exact float32 decode rounded once to `dtype` — so a custom kernel can
+write bfloat16 directly without materializing the float32 intermediate:
 
 ```python
 gguf_jax.register_dequant(qtype, my_kernel, override=True)
 ```
 
-everything else (`QuantizedArray`, loader, tests) is unchanged.
+`gguf_jax.cute` (optional `cute` dependency group: nvidia-cutlass-dsl,
+jax-tvm-ffi, and [cutejax](../cutedsl-jax)) provides a Q4_K kernel written in
+CuTe DSL as the demonstrator; `gguf_jax.cute.register()` swaps it in behind
+the normal `QuantizedArray` API, and the same bitwise test battery applies to
+it. Layout: one CTA per 8 superblocks, 32 lanes per superblock, 8 elements
+per lane with warp-coalesced stores; the f16/uint32 fields are read through
+`cute.recast_ptr` views of the one uint8 buffer.
+
+Measured on an RTX 5070 Ti (`bench/bench_dequant.py`, (4096, 14336) weight,
+dequantize only, effective bandwidth = bytes in + out over wall time):
+
+| kernel      | f32 out            | bf16 out           |
+|-------------|--------------------|--------------------|
+| pure XLA    | 468 µs, 572 GB/s   | 274 µs, 549 GB/s   |
+| cute Q4_K   | 433 µs, 619 GB/s   | 224 µs, 671 GB/s   |
+
+The remaining headroom (~896 GB/s peak) is scattered small stores; fused
+dequant-matmul, where the dense matrix never reaches HBM at all, is the real
+prize and the intended next step.
 
 ## Development
 

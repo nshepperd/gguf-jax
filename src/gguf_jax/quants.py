@@ -14,7 +14,7 @@ entry with :func:`register_dequant`.
 """
 from __future__ import annotations
 
-from typing import Callable
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -32,8 +32,10 @@ __all__ = [
     "GGMLQuantizationType",
 ]
 
-# fn(blocks: uint8[n_blocks, type_size]) -> float32[n_blocks, block_size]
-DequantFn = Callable[[jax.Array], jax.Array]
+# fn(blocks: uint8[n_blocks, type_size], dtype) -> dtype[n_blocks, block_size]
+# The result must equal the bitwise-exact float32 decode rounded once to
+# ``dtype`` (a no-op for float32).
+DequantFn = Callable[[jax.Array, Any], jax.Array]
 
 _DEQUANT: dict[GGMLQuantizationType, DequantFn] = {}
 
@@ -41,9 +43,12 @@ _DEQUANT: dict[GGMLQuantizationType, DequantFn] = {}
 def register_dequant(qtype: GGMLQuantizationType, fn: DequantFn, *, override: bool = False) -> None:
     """Register a block-dequantization kernel for ``qtype``.
 
-    ``fn`` maps ``uint8[n_blocks, type_size]`` to ``float32[n_blocks, block_size]``.
-    Pass ``override=True`` to replace the built-in pure-JAX kernel with e.g. a
-    custom cutejax kernel.
+    ``fn`` maps ``uint8[n_blocks, type_size]`` plus a target dtype to
+    ``dtype[n_blocks, block_size]``; the values must be the bitwise-exact
+    float32 decode rounded once to ``dtype``. A kernel that computes natively
+    in the output dtype (e.g. a fused cutejax kernel writing bfloat16) avoids
+    materializing the float32 intermediate. Pass ``override=True`` to replace
+    the built-in pure-JAX kernel.
     """
     if qtype in _DEQUANT and not override:
         raise ValueError(f"dequant kernel for {qtype.name} already registered")
@@ -55,8 +60,17 @@ def supported_types() -> list[GGMLQuantizationType]:
 
 
 def _register(qtype: GGMLQuantizationType):
-    def deco(fn: DequantFn) -> DequantFn:
-        register_dequant(qtype, fn)
+    """Register a float32-computing kernel, adding the output-dtype cast.
+
+    The built-in pure-JAX kernels compute in float32 (that is what the
+    bitwise contract is defined against); the cast to the requested dtype
+    fuses into the surrounding XLA computation, so this costs nothing.
+    """
+    def deco(fn: Callable[[jax.Array], jax.Array]):
+        def wrapper(blocks: jax.Array, dtype) -> jax.Array:
+            return fn(blocks).astype(dtype)
+        wrapper.__name__ = fn.__name__
+        register_dequant(qtype, wrapper)
         return fn
     return deco
 
@@ -700,8 +714,9 @@ def _dequant_iq4_xs(blocks: jax.Array) -> jax.Array:
 # ---------------------------------------------------------------------------
 # top-level entry points
 
-def dequantize_blocks(blocks: jax.Array, qtype: GGMLQuantizationType) -> jax.Array:
-    """Dequantize ``uint8[n_blocks, type_size]`` to ``float32[n_blocks, block_size]``."""
+def dequantize_blocks(blocks: jax.Array, qtype: GGMLQuantizationType,
+                      dtype=jnp.float32) -> jax.Array:
+    """Dequantize ``uint8[n_blocks, type_size]`` to ``dtype[n_blocks, block_size]``."""
     block_size, type_size = GGML_QUANT_SIZES[qtype]
     if qtype not in _DEQUANT:
         raise NotImplementedError(f"Dequantization for {qtype.name} is not implemented")
@@ -709,20 +724,21 @@ def dequantize_blocks(blocks: jax.Array, qtype: GGMLQuantizationType) -> jax.Arr
         raise ValueError(
             f"expected uint8 blocks of shape (n_blocks, {type_size}) for {qtype.name}, "
             f"got {blocks.dtype} {blocks.shape}")
-    out = _DEQUANT[qtype](blocks)
+    out = _DEQUANT[qtype](blocks, dtype)
     assert out.shape == (blocks.shape[0], block_size)
     return out
 
 
-def dequantize(data: jax.Array, qtype: GGMLQuantizationType) -> jax.Array:
-    """Dequantize a byte-shaped uint8 array to float32.
+def dequantize(data: jax.Array, qtype: GGMLQuantizationType, dtype=jnp.float32) -> jax.Array:
+    """Dequantize a byte-shaped uint8 array.
 
     ``data`` has shape ``(..., row_bytes)`` (the layout produced by
     ``gguf.quants.quantize`` and stored in GGUF files); the result has shape
-    ``(..., row_bytes // type_size * block_size)``. Bitwise identical to
-    ``gguf.quants.dequantize``.
+    ``(..., row_bytes // type_size * block_size)``. With ``dtype=float32``
+    (the default) the result is bitwise identical to
+    ``gguf.quants.dequantize``; other dtypes are that result rounded once.
     """
     block_size, type_size = GGML_QUANT_SIZES[qtype]
     shape = _ref.quant_shape_from_byte_shape(data.shape, qtype)
     blocks = data.reshape(-1, type_size)
-    return dequantize_blocks(blocks, qtype).reshape(shape)
+    return dequantize_blocks(blocks, qtype, dtype).reshape(shape)
