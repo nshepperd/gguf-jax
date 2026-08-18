@@ -1,10 +1,9 @@
 """Round-trip test: write a GGUF file with gguf-py, load it with gguf_jax."""
 
-import numpy as np
-import pytest
-
 import gguf
 import jax.numpy as jnp
+import numpy as np
+import pytest
 from gguf import GGUFWriter
 from gguf.constants import GGMLQuantizationType
 

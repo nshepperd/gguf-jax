@@ -7,7 +7,6 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-
 from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType
 
 from . import quants
@@ -46,9 +45,9 @@ class QuantizedArray:
     """
 
     data: jax.Array
-    qtype: GGMLQuantizationType = field(metadata=dict(static=True))
-    shape: tuple[int, ...] = field(metadata=dict(static=True))
-    dtype: Any = field(default=jnp.bfloat16, metadata=dict(static=True))
+    qtype: GGMLQuantizationType = field(metadata={"static": True})
+    shape: tuple[int, ...] = field(metadata={"static": True})
+    dtype: Any = field(default=jnp.bfloat16, metadata={"static": True})
 
     @property
     def ndim(self) -> int:

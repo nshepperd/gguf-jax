@@ -49,7 +49,6 @@ def assert_bitwise_equal(ours: np.ndarray, ref: np.ndarray, qtype):
 
 def random_bytes(qtype, shape, seed):
     """Random byte-shaped quantized data with the logical shape ``shape``."""
-    _, type_size = GGML_QUANT_SIZES[qtype]
     byte_shape = gguf.quants.quant_shape_to_byte_shape(shape, qtype)
     rng = np.random.default_rng(seed)
     return rng.integers(0, 256, size=byte_shape, dtype=np.uint8)

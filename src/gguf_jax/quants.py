@@ -14,22 +14,22 @@ entry with :func:`register_dequant`.
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from gguf import quants as _ref
+from gguf.constants import GGML_QUANT_SIZES, QK_K, GGMLQuantizationType
 from jax import lax
 
-from gguf import quants as _ref
-from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType, QK_K
-
 __all__ = [
+    "GGMLQuantizationType",
     "dequantize",
     "dequantize_blocks",
     "register_dequant",
     "supported_types",
-    "GGMLQuantizationType",
 ]
 
 # fn(blocks: uint8[n_blocks, type_size], dtype) -> dtype[n_blocks, block_size]
@@ -738,7 +738,7 @@ def dequantize(data: jax.Array, qtype: GGMLQuantizationType, dtype=jnp.float32) 
     (the default) the result is bitwise identical to
     ``gguf.quants.dequantize``; other dtypes are that result rounded once.
     """
-    block_size, type_size = GGML_QUANT_SIZES[qtype]
+    _, type_size = GGML_QUANT_SIZES[qtype]
     shape = _ref.quant_shape_from_byte_shape(data.shape, qtype)
     blocks = data.reshape(-1, type_size)
     return dequantize_blocks(blocks, qtype, dtype).reshape(shape)

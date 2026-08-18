@@ -25,13 +25,11 @@ accumulation order.
 """
 from __future__ import annotations
 
+import cutejax
 import cutlass
-import cutlass.utils as utils
 import jax
 import jax.numpy as jnp
-from cutlass import cute
-
-import cutejax
+from cutlass import cute, utils
 from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType
 
 QK_K = 256
@@ -260,14 +258,13 @@ def _q4k_gemm_kernel(
             )
             _fill_b(tCrB, tCcB, sBq, sBh, k_block_next, stage_read)
 
-            if k_block == 0:
-                if k_tile + _STAGES - 1 < k_tile_count:
-                    cute.copy(
-                        tiled_copy_A,
-                        tAgA[None, None, None, k_tile_index],
-                        tAsA[None, None, None, smem_pipe_write],
-                        pred=tApA,
-                    )
+            if k_block == 0 and k_tile + _STAGES - 1 < k_tile_count:
+                cute.copy(
+                    tiled_copy_A,
+                    tAgA[None, None, None, k_tile_index],
+                    tAsA[None, None, None, smem_pipe_write],
+                    pred=tApA,
+                )
 
             cute.gemm(
                 tiled_mma,

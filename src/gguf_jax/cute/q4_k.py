@@ -20,12 +20,11 @@ hardware f16->f32 convert is used instead of manual bit widening.
 """
 from __future__ import annotations
 
+import cutejax
 import cutlass
 import jax
 import jax.numpy as jnp
 from cutlass import cute
-
-import cutejax
 from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType
 
 QK_K = 256

@@ -2,12 +2,12 @@
 
 import gguf
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from gguf.constants import GGMLQuantizationType
 
 import gguf_jax
-import jax.numpy as jnp
 from tests.test_bitwise import assert_bitwise_equal, logical_shapes, random_bytes
 
 cute_mod = pytest.importorskip("gguf_jax.cute")

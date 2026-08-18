@@ -1,16 +1,16 @@
 """Load GGUF files into JAX-ready QuantizedArrays."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 import jax.numpy as jnp
 import numpy as np
-
 from gguf import GGUFReader
 from gguf.constants import GGMLQuantizationType
 
-from .array import QuantizedArray, _NATIVE_TYPES
+from .array import _NATIVE_TYPES, QuantizedArray
 
 __all__ = ["GGUFFile", "load_gguf"]
 
@@ -53,7 +53,8 @@ def load_gguf(
     for name, fld in reader.fields.items():
         try:
             metadata[name] = fld.contents()
-        except Exception:  # tolerate exotic field layouts rather than fail the load
+        # tolerate exotic field layouts rather than fail the load
+        except Exception:  # noqa: BLE001
             metadata[name] = None
 
     tensors: dict[str, QuantizedArray] = {}
