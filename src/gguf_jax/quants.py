@@ -14,6 +14,7 @@ entry with :func:`register_dequant`.
 """
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 from typing import Any
 
@@ -67,9 +68,9 @@ def _register(qtype: GGMLQuantizationType):
     fuses into the surrounding XLA computation, so this costs nothing.
     """
     def deco(fn: Callable[[jax.Array], jax.Array]):
+        @functools.wraps(fn)
         def wrapper(blocks: jax.Array, dtype) -> jax.Array:
             return fn(blocks).astype(dtype)
-        wrapper.__name__ = fn.__name__
         register_dequant(qtype, wrapper)
         return fn
     return deco

@@ -328,7 +328,7 @@ def _q4k_gemm_launch(stream, gU: cute.Tensor, gX: cute.Tensor, gO: cute.Tensor):
 
     # gmem -> smem copies
     atom_async_a = cute.make_copy_atom(
-        cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL),
+        cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
         cutlass.BFloat16, num_bits_per_copy=128)
     tiled_copy_A = cute.make_tiled_copy_tv(
         atom_async_a,
@@ -338,7 +338,7 @@ def _q4k_gemm_launch(stream, gU: cute.Tensor, gX: cute.Tensor, gO: cute.Tensor):
     # cp.async supports only 128-bit copies: split each 36-word row into
     # words 0..31 (all 128 threads) and words 32..35 (threads < 64)
     atom_async_b = cute.make_copy_atom(
-        cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL),
+        cute.nvgpu.cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
         cutlass.Int32, num_bits_per_copy=128)
     tiled_copy_B1 = cute.make_tiled_copy_tv(
         atom_async_b,

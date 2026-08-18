@@ -30,3 +30,18 @@ test = [
 
 [tool.uv.sources]
 cutedsl-jax = { path = "/home/em/Dev/neural/cutedsl-jax", editable = true }
+
+[tool.ty.environment]
+# cutlass ships inside the nvidia-cutlass-dsl wheel and is put on sys.path at
+# runtime by a .pth file, which ty does not execute.
+extra-paths = [".venv/lib/python3.14/site-packages/nvidia_cutlass_dsl/dsl_packages"]
+
+# The CuTe DSL's traced types (Integer, Numeric, cute layouts) support
+# subscripting and bitwise ops at trace time without declaring them, so ty
+# reports them against kernel code that is correct and GPU-tested.
+[[tool.ty.overrides]]
+include = ["src/gguf_jax/cute/**"]
+
+[tool.ty.overrides.rules]
+not-subscriptable = "ignore"
+unsupported-operator = "ignore"

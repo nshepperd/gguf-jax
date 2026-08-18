@@ -36,8 +36,10 @@ def assert_bitwise_equal(ours: np.ndarray, ref: np.ndarray, qtype):
     """
     assert ours.shape == ref.shape
     assert ours.dtype == ref.dtype == np.float32
-    ours_bits = ours.view(np.uint32)
-    ref_bits = ref.view(np.uint32)
+    # np.dtype(...) rather than the bare scalar type: the latter picks a
+    # `.view()` overload whose result type confuses type checkers.
+    ours_bits = ours.view(np.dtype(np.uint32))
+    ref_bits = ref.view(np.dtype(np.uint32))
     mismatch = (ours_bits != ref_bits) & ~(np.isnan(ours) & np.isnan(ref))
     if mismatch.any():
         idx = tuple(a[0] for a in np.nonzero(mismatch))
@@ -89,11 +91,11 @@ def test_quantized_floats_bitwise(qtype):
     values *= 10.0 ** rng.integers(-8, 8, size=(shape[0], 1)).astype(np.float32)
     values[0, :] = 0.0  # all-zero block edge case
     try:
-        data = gguf.quants.quantize(values, qtype)
+        data: np.ndarray = gguf.quants.quantize(values, qtype)
     except NotImplementedError:
         pytest.skip(f"gguf-py cannot quantize {qtype.name}")
     if data.dtype != np.uint8:  # F16/F32 come back as native floats
-        data = np.ascontiguousarray(data).view(np.uint8)
+        data = np.ascontiguousarray(data).view(np.dtype(np.uint8))
     ref = gguf.quants.dequantize(data, qtype)
     ours = np.asarray(gguf_jax.dequantize(jnp.asarray(data), qtype))
     assert_bitwise_equal(ours, ref, qtype)
