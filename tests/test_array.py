@@ -30,7 +30,6 @@ def test_dequantize_dtype_cast():
     out = qa.dequantize()
     assert out.dtype == jnp.bfloat16
     f32 = qa.dequantize(dtype=jnp.float32)
-    # the bf16 result is exactly the rounded f32 result
     np.testing.assert_array_equal(
         np.asarray(out).view(np.uint16), np.asarray(f32.astype(jnp.bfloat16)).view(np.uint16))
     assert qa.astype(jnp.float16).dequantize().dtype == jnp.float16

@@ -109,7 +109,6 @@ def _q4k_gemm_kernel(
     mcA = cute.make_identity_tensor(mX.layout.shape)
     cA = cute.local_tile(mcA, tiler=(_BM, _BK), coord=(bidx, None))
 
-    # shared memory
     @cute.struct
     class SharedStorage:
         a: cute.struct.Align[
@@ -232,7 +231,6 @@ def _q4k_gemm_kernel(
     tCsA_p = tCsA_copy_view[None, None, None, smem_pipe_read]
 
     num_k_block = cute.size(tCrA, mode=[2])
-
 
     # prefetch first k-block from the first k-tile
     cute.arch.cp_async_wait_group(_STAGES - 2)

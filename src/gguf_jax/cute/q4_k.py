@@ -48,9 +48,9 @@ def _q4_k_kernel(gU: cute.Tensor, gW: cute.Tensor, gH: cute.Tensor,
         dmin = cutlass.Float32(gH[s, 1])
 
         # scale words: bytes 4..15 = uint32 words 1..3 of the superblock
-        w_d = cutlass.Int32(gW[s, 1])   # 4 "d row" bytes
-        w_m = cutlass.Int32(gW[s, 2])   # 4 "m row" bytes
-        w_md = cutlass.Int32(gW[s, 3])  # 4 "m_d row" bytes
+        w_d = cutlass.Int32(gW[s, 1])
+        w_m = cutlass.Int32(gW[s, 2])
+        w_md = cutlass.Int32(gW[s, 3])
 
         # Lane w handles elements {32k + w : k in 0..7}: every store
         # instruction below is warp-contiguous, the sub-block index k is a
@@ -102,18 +102,16 @@ def dequantize_q4_k(data: jax.Array, dtype=jnp.float32) -> jax.Array:
 # ---------------------------------------------------------------------------
 # fused dequant-matmul: y = x @ W^T with W kept quantized in HBM
 #
-# GEMV-style mapping for small M (LLM decode/small-batch prefill): one warp
-# per output row n of W. Lane w walks the row's superblocks handling elements
-# {32k + w}, dequantizes into registers (rounded through bf16 so results
-# match dequantize-then-matmul semantics), multiplies with x[m, e] and
-# accumulates in float32; a butterfly-shuffle reduction folds the 32 lanes.
-# M is compile-time static (one kernel specialization per batch size).
+# GEMV-style mapping for small M: one warp per output row n of W. Lane w walks
+# the row's superblocks handling elements {32k + w}, dequantizes into registers
+# (rounded through bf16, matching dequantize-then-matmul), multiplies with
+# x[m, e] and accumulates in float32; a butterfly-shuffle reduction folds the
+# 32 lanes. M is compile-time static (one specialization per batch size).
 
-# Measured crossovers on RTX 5070 Ti (4096x14336 weight): the warp-GEMV
-# wins at M <= 2 (73us vs the tensor-core GEMM's flat 91us); the
-# tensor-core GEMM (q4_k_gemm.py) wins from there until ~M=160, where
-# dequantize-then-matmul takes over because it reads the quantized weight
-# once instead of once per 32-row M-tile.
+# Crossovers measured on an RTX 5070 Ti (4096x14336 weight): warp-GEMV wins at
+# M <= 2 (73us vs the tensor-core GEMM's flat 91us), the tensor-core GEMM
+# (q4_k_gemm.py) until ~M=160, where dequantize-then-matmul takes over: it
+# reads the quantized weight once instead of once per 32-row M-tile.
 _GEMV_MAX_M = 2
 _GEMM_MAX_M = 128
 
@@ -236,12 +234,7 @@ def matmul_q4_k(x: jax.Array, w, *, force_fused: bool = False) -> jax.Array:
 
 
 def register() -> None:
-    """Replace the pure-JAX Q4_K kernel with the cute kernel.
-
-    The kernel computes in float32 and writes the requested output dtype
-    directly (single hardware round), so no float32 intermediate is
-    materialized for bfloat16 dequantization.
-    """
+    """Replace the pure-JAX Q4_K kernel with the cute kernel."""
     from gguf_jax import quants
 
     quants.register_dequant(

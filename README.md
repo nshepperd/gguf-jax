@@ -1,29 +1,35 @@
 # gguf-jax
 
 Load GGUF-quantized models (llama.cpp quants) directly in JAX and dequantize
-on the fly during the forward pass — the same trick as
-[bitsandbytes-jax](../bitsandbytes-jax) for bnb 4-bit, but for GGUF files.
-
-Tensors are held as raw uint8 block data in a `QuantizedArray` pytree and
-decoded by pure-JAX kernels whose float32 output is **bitwise identical** to
-the `gguf.quants` numpy reference implementation from llama.cpp (gguf-py).
+on the fly during the forward pass — the same trick as bitsandbytes-jax for
+bnb 4-bit, but for GGUF files.
 
 ```python
 import jax.numpy as jnp
 import gguf_jax
 
 model = gguf_jax.load_gguf("llama-3.2-1b-Q4_K_M.gguf", dtype=jnp.bfloat16)
-print(model.metadata["general.architecture"])
-
 w = model.tensors["blk.0.attn_q.weight"]   # QuantizedArray(Q4_K, shape=(2048, 2048), ...)
 
 # inside your (jitted) forward pass:
 y = x @ w.dequantize().T                   # bfloat16, decoded on the fly
 ```
 
-`QuantizedArray` is a registered pytree (the uint8 payload is the only leaf;
-qtype/shape/dtype are static), so it composes with `jax.jit`, `tree_map`,
-checkpointing utilities, etc.
+## Features
+
+- **Nothing is dequantized at load time.** Tensors stay as raw uint8 block data
+  in a `QuantizedArray` and are decoded inside your forward pass, so only the
+  quantized bytes live in device memory.
+- **Bitwise-exact.** The float32 decode is bit-for-bit identical to the
+  `gguf.quants` numpy reference from llama.cpp (gguf-py), for every supported
+  qtype — see [docs/bitwise-correctness.md](docs/bitwise-correctness.md).
+- **A pytree.** `QuantizedArray` is a registered dataclass with the uint8
+  payload as its only leaf (qtype/shape/dtype are static), so it composes with
+  `jax.jit`, `tree_map`, checkpointing utilities, etc.
+- **Pluggable kernels.** `register_dequant` swaps in a faster decode for a
+  qtype. `gguf_jax.cute` ships CuTe DSL kernels for Q4_K, including a fused
+  dequant-matmul that keeps the weights quantized in HBM — see
+  [docs/cute-kernels.md](docs/cute-kernels.md).
 
 ## Supported quant types
 
@@ -39,118 +45,19 @@ Everything the gguf-py reference can dequantize:
 ## API
 
 - `load_gguf(path, dtype=jnp.bfloat16, tensor_filter=None) -> GGUFFile` —
-  metadata dict + `dict[str, QuantizedArray]`. Payloads are uploaded to the
-  default JAX device as-is (no dequantization at load time); use
-  `jax.default_device(...)` to control placement.
-- `QuantizedArray.dequantize(dtype=None)` — decode to a dense array
-  (computes in float32, then casts to `dtype`, default `self.dtype`).
+  metadata dict + `dict[str, QuantizedArray]`. Payloads go to the default JAX
+  device as-is; use `jax.default_device(...)` to control placement.
+- `QuantizedArray.dequantize(dtype=None)` — decode to a dense array (computes
+  in float32, then casts to `dtype`, default `self.dtype`).
 - `QuantizedArray.from_bytes(data, qtype, shape=None, dtype=...)` — wrap raw
-  quantized bytes you got from somewhere else.
+  quantized bytes from elsewhere.
 - `dequantize(data, qtype)` — functional form on byte-shaped uint8 arrays,
   drop-in equivalent of `gguf.quants.dequantize`.
-- `quantize(array, qtype)` — host-side convenience wrapper around the gguf-py
-  reference quantizer (only the types gguf-py can quantize).
-
-## Bitwise correctness
-
-The test suite (`tests/test_bitwise.py`) checks every supported qtype against
-`gguf.quants.dequantize`, eagerly and under `jit`, on:
-
-- fully random block bytes (every bit pattern decodes, so this covers all
-  field encodings, including non-finite f16 scales), and
-- realistic data round-tripped through the reference quantizer.
-
-Equality is on raw float32 bit patterns — signed zeros, infinities and
-subnormals included. The one carve-out: where *both* sides produce NaN
-(possible only with non-finite block scales, which valid GGUF files never
-contain), NaN sign/payload bits are not compared, since IEEE 754 leaves NaN
-propagation through arithmetic unspecified and XLA fusion and numpy disagree.
-
-Two implementation notes for exactness:
-
-- f16→f32 widening uses explicit bit manipulation for the non-finite cases
-  (XLA's convert canonicalizes NaN payloads; numpy preserves them).
-- XLA:CPU compiles with flush-to-zero, so the MXFP4 kernel constructs exact
-  subnormal results with integer ops when the E8M0 scale is subnormal.
-
-## CuTe DSL kernels
-
-The pure-JAX kernels are the reference path: dequantization is expressed as
-plain XLA ops (bit twiddling + gathers + multiplies). Registered kernels have
-the contract `fn(blocks_u8, dtype) -> dtype[n_blocks, block_size]` — the
-bitwise-exact float32 decode rounded once to `dtype` — so a custom kernel can
-write bfloat16 directly without materializing the float32 intermediate:
-
-```python
-gguf_jax.register_dequant(qtype, my_kernel, override=True)
-```
-
-`gguf_jax.cute` (optional `cute` dependency group: nvidia-cutlass-dsl,
-jax-tvm-ffi, and [cutejax](../cutedsl-jax)) provides a Q4_K kernel written in
-CuTe DSL as the demonstrator; `gguf_jax.cute.register()` swaps it in behind
-the normal `QuantizedArray` API, and the same bitwise test battery applies to
-it. Layout: one CTA per 8 superblocks, 32 lanes per superblock, 8 elements
-per lane with warp-coalesced stores; the f16/uint32 fields are read through
-`cute.recast_ptr` views of the one uint8 buffer.
-
-Measured on an RTX 5070 Ti (`bench/bench_dequant.py`, (4096, 14336) weight,
-dequantize only, effective bandwidth = bytes in + out over wall time):
-
-| kernel      | f32 out            | bf16 out           |
-|-------------|--------------------|--------------------|
-| pure XLA    | 468 µs, 572 GB/s   | 274 µs, 549 GB/s   |
-| cute Q4_K   | 433 µs, 619 GB/s   | 224 µs, 671 GB/s   |
-
-The remaining headroom (~896 GB/s peak) is scattered small stores.
-
-### Fused dequant-matmul
-
-`gguf_jax.cute.matmul_q4_k(x, w)` computes `x @ w.T` (`x` bfloat16
-`(..., K)`, `w` a Q4_K `QuantizedArray` `(N, K)`) with the weights
-dequantized on the fly — the dense matrix never touches HBM. Weights are
-rounded through bfloat16 in-register, so values match
-`x @ w.dequantize(bfloat16).T` up to f32 summation order (~1 ulp of bf16).
-It dispatches on the flattened batch size M across two kernels:
-
-- **M ≤ 2 — warp-GEMV** (`q4_k.py`): one warp per output row, scalar FMA
-  against per-lane dequantized weights, butterfly-shuffle reduction.
-  Specializes per M.
-- **3 ≤ M ≤ 128 — tensor-core GEMM** (`q4_k_gemm.py`): a proper
-  `mma.sync.m16n8k16` bf16 GEMM (SM80-class atoms, runs on SM120), modeled
-  on CuTeDSL's Ampere TensorOpGemm, except the B operand flows through the
-  cp.async pipeline *quantized* (144B per row per superblock — 3.5× less
-  smem traffic) and is decoded at the smem→register stage straight into the
-  MMA B-fragments, via an identity-tensor partition that supplies each
-  fragment element's (n, k) coordinate. Tile (bM, bN, bK) = (32, 64, 256) —
-  bK is exactly one Q4_K superblock. M is dynamic: one compile serves all
-  batch sizes; requires N % 64 == 0.
-- **M > 128 — dequantize-then-matmul**: re-reading the quantized weight
-  once per 32-row M-tile stops paying; a single dequant + dense GEMM wins.
-
-`matmul_q4_k(x, w, force_fused=True)` forbids that last fallback and keeps
-the tensor-core kernel for every M, so the dense bf16 weight (2·N·K bytes)
-is never materialized — useful when the weight is large and memory is the
-constraint. Costs ~1.5× at M=512 vs the fallback; requires N % 64 == 0
-above the GEMV range.
-
-`bench/bench_matmul.py`, same 4096×14336 weight (33MB quantized, 117MB
-dense):
-
-| M   | fused (dispatch) | tc-gemm  | unfused  | dense bf16 matmul |
-|-----|------------------|----------|----------|-------------------|
-| 1   |  73 µs (gemv)    |  91 µs   | 379 µs   | 156 µs            |
-| 4   |  91 µs           |  91 µs   | 405 µs   | 147 µs            |
-| 16  |  91 µs           |  91 µs   | 389 µs   | 154 µs            |
-| 32  |  92 µs           |  92 µs   | 399 µs   | 164 µs            |
-| 64  | 188 µs           | 188 µs   | 398 µs   | 164 µs            |
-| 128 | 366 µs           | 366 µs   | 444 µs   | 198 µs            |
-| 512 | 883 µs (unfused) | 1365 µs  | 883 µs   | 643 µs            |
-
-The tensor-core path is flat at ~91 µs through M = 32 (one M-tile): 4.3×
-the unfused path, and faster than a dense bf16 matmul with resident weights
-up to M ≈ 64 — the quantized bytes are simply less memory to read. Obvious
-next lever: at large M, keep W-tile reuse across M-tiles (split-K /
-persistent CTAs) instead of falling back.
+- `quantize(array, qtype)` — host-side wrapper around the gguf-py reference
+  quantizer (only the types gguf-py can quantize).
+- `register_dequant(qtype, fn, override=False)` — install a custom kernel.
+- `gguf_jax.cute.register()` / `gguf_jax.cute.matmul_q4_k(x, w)` — the optional
+  CuTe DSL Q4_K kernels.
 
 ## Development
 
