@@ -181,26 +181,11 @@ wheels = [
 [[package]]
 name = "cutedsl-jax"
 version = "0.1.0"
-source = { editable = "/home/em/Dev/neural/cutedsl-jax" }
+source = { git = "https://github.com/nshepperd/cutejax#edd168185df78cb9abbe7f322dd9fa812d7fd1f8" }
 dependencies = [
     { name = "jax" },
     { name = "jax-tvm-ffi" },
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "jax" },
-    { name = "jax-tvm-ffi" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"] },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "equinox" },
-    { name = "hypothesis", specifier = ">=6.161.2" },
-    { name = "jax", extras = ["cuda13"] },
-    { name = "pytest", specifier = ">=9.1.1" },
 ]
 
 [[package]]
@@ -223,37 +208,35 @@ name = "gguf-jax"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cutedsl-jax" },
     { name = "gguf" },
     { name = "jax" },
+    { name = "jax-tvm-ffi" },
     { name = "numpy" },
+    { name = "nvidia-cutlass-dsl" },
 ]
 
 [package.dev-dependencies]
-cute = [
-    { name = "cutedsl-jax" },
-    { name = "jax-tvm-ffi" },
-    { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
-]
 test = [
     { name = "jax", extra = ["cuda13"] },
+    { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "cutedsl-jax", git = "https://github.com/nshepperd/cutejax" },
     { name = "gguf", specifier = ">=0.19.0" },
     { name = "jax", specifier = ">=0.11.0" },
+    { name = "jax-tvm-ffi", specifier = ">=0.1.3" },
     { name = "numpy", specifier = ">=2.5.1" },
+    { name = "nvidia-cutlass-dsl", specifier = ">=4.7.0" },
 ]
 
 [package.metadata.requires-dev]
-cute = [
-    { name = "cutedsl-jax", editable = "/home/em/Dev/neural/cutedsl-jax" },
-    { name = "jax-tvm-ffi", specifier = ">=0.1.3" },
-    { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = ">=4.7.0" },
-]
 test = [
     { name = "jax", extras = ["cuda13"], specifier = ">=0.11.0" },
+    { name = "nvidia-cutlass-dsl", extras = ["cu13"], specifier = ">=4.7.0" },
     { name = "pytest", specifier = ">=9.1.1" },
 ]
 
