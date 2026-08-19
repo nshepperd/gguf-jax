@@ -16,6 +16,19 @@ dependencies = [
     "nvidia-cutlass-dsl>=4.7.0",
 ]
 
+# The CuTe DSL's cu13 runtime libraries sit behind an extra (the cu12 ones are
+# an unconditional requirement of the wheel, so there is no cu12 extra to
+# mirror). The fused Q4_K kernels need whichever matches the CUDA build of the
+# installed jax. Neither this package nor cutejax picks one -- both install
+# against either -- so the choice is forwarded to the end-user project as
+# gguf-jax[cu13].
+#
+# Without it the kernels still *import*, and every quantized matmul silently
+# falls back to dequantizing whole weight tensors: on MiniMax Music 3 that is
+# a 4.6 GB allocation for the LM, which OOMs a 16 GB card mid-generation.
+[project.optional-dependencies]
+cu13 = ["cutejax[cu13]"]
+
 [build-system]
 requires = ["uv_build>=0.12.0,<0.13.0"]
 build-backend = "uv_build"
