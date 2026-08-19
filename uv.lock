@@ -179,13 +179,13 @@ wheels = [
 ]
 
 [[package]]
-name = "cutedsl-jax"
+name = "cutejax"
 version = "0.1.0"
-source = { git = "https://github.com/nshepperd/cutejax#edd168185df78cb9abbe7f322dd9fa812d7fd1f8" }
+source = { git = "https://github.com/nshepperd/cutejax#61b7602ac5da6c50519ea971c4b241aa46e391b3" }
 dependencies = [
     { name = "jax" },
     { name = "jax-tvm-ffi" },
-    { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
+    { name = "nvidia-cutlass-dsl" },
 ]
 
 [[package]]
@@ -208,7 +208,7 @@ name = "gguf-jax"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "cutedsl-jax" },
+    { name = "cutejax" },
     { name = "gguf" },
     { name = "jax" },
     { name = "jax-tvm-ffi" },
@@ -225,7 +225,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cutedsl-jax", git = "https://github.com/nshepperd/cutejax" },
+    { name = "cutejax", git = "https://github.com/nshepperd/cutejax" },
     { name = "gguf", specifier = ">=0.19.0" },
     { name = "jax", specifier = ">=0.11.0" },
     { name = "jax-tvm-ffi", specifier = ">=0.1.3" },
