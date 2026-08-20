@@ -1,4 +1,4 @@
-"""Q4_K vs Q6_K warp-GEMV at matched shapes, to separate two explanations.
+"""The k-quant warp-GEMVs at matched shapes, to separate two explanations.
 
 Profiling Qwen3-VL-8B decode showed the Q6_K GEMV at 610 GB/s and the Q4_K one
 at 442 on nominally comparable work, which reads as "the Q6_K kernel is better".
@@ -8,9 +8,10 @@ warp per output row, one loop iteration per superblock, 8 chunks per iteration
 carries 210 bytes against Q4_K's 144. A kernel bound by anything other than
 bandwidth therefore posts a 1.46x higher GB/s for doing the same work.
 
-This runs both types at IDENTICAL (N, K) so the two readings can be compared
-directly. Both do N*K/256 warp-iterations at any shape, so ns/iter is the
-like-for-like column and GB/s is the one that can mislead.
+This runs every type at IDENTICAL (N, K) so the readings can be compared
+directly. All of them do N*K/256 warp-iterations at any shape, so ns/iter is
+the like-for-like column and GB/s is the one that can mislead. Q5_K (176 B)
+and IQ4_XS (136 B) sit either side of Q4_K's 144 on that axis.
 
 The card has 48 MB of L2 and most of these weights are smaller than that, so a
 timing loop over one weight measures L2 rather than DRAM -- which is how an
@@ -19,7 +20,7 @@ therefore rotates over enough distinct weights to exceed L2 twice over, the way
 a decode step does when it walks 4.7 GB of them.
 
     XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async XLA_PYTHON_CLIENT_MEM_FRACTION=0.4 \
-        uv run python bench/gemv_shapes.py
+        uv run python bench/gemv_shapes.py [--types q4_k,q5_k,q6_k,iq4_xs]
 """
 from __future__ import annotations
 
@@ -32,7 +33,7 @@ import numpy as np
 from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType as QT
 
 import gguf_jax
-from gguf_jax.cute import matmul_q4_k, matmul_q6_k
+from gguf_jax.cute import matmul_iq4_xs, matmul_q4_k, matmul_q5_k, matmul_q6_k
 
 SMS = 70            # RTX 5070 Ti; only used to report wave count
 L2_BYTES = 48 << 20  # GB203; weights below this would be timed out of cache
@@ -47,16 +48,23 @@ SHAPES = [
 ]
 
 
+# qtype -> (kernel, byte slice holding the f16 super-scale(s))
+KERNELS = {
+    QT.Q4_K: (matmul_q4_k, slice(0, 4)),      # d, dmin
+    QT.Q5_K: (matmul_q5_k, slice(0, 4)),      # d, dmin
+    QT.Q6_K: (matmul_q6_k, slice(208, 210)),  # d
+    QT.IQ4_XS: (matmul_iq4_xs, slice(0, 2)),  # d
+}
+
+
 def make_weight(n: int, k: int, qtype: QT, rng) -> gguf_jax.QuantizedArray:
     bpb = GGML_QUANT_SIZES[qtype][1]
     nb = n * k // 256
     data = rng.integers(0, 256, size=(nb, bpb), dtype=np.uint8)
     # Keep the f16 super-scales small so nothing overflows into inf.
     scale = (rng.normal(size=(nb, 2)) * 0.05).astype(np.float16).view(np.uint8)
-    if qtype == QT.Q4_K:
-        data[:, :4] = scale              # d, dmin at bytes 0..3
-    else:
-        data[:, 208:210] = scale[:, :2]  # d at bytes 208..209
+    sl = KERNELS[qtype][1]
+    data[:, sl] = scale[:, : sl.stop - sl.start]
     return gguf_jax.QuantizedArray.from_bytes(
         data.reshape(n, -1), qtype, shape=(n, k))
 
@@ -80,17 +88,21 @@ def main() -> None:
     p.add_argument("--iters", type=int, default=200)
     p.add_argument("--bandwidth", type=float, default=790.0,
                    help="achievable GB/s, for the last column")
+    p.add_argument("--types", default="q4_k,q5_k,q6_k,iq4_xs",
+                   help="comma-separated qtypes to run")
     args = p.parse_args()
+    qtypes = [QT[t.strip().upper()] for t in args.types.split(",")]
 
     rng = np.random.default_rng(0)
     print(f"{jax.devices()[0].device_kind}, M={args.batch}\n")
-    print(f"{'shape':>16s} {'type':>5s} {'CTAs':>6s} {'waves':>6s} {'MB':>6s} "
+    print(f"{'shape':>16s} {'type':>6s} {'CTAs':>6s} {'waves':>6s} {'MB':>6s} "
           f"{'x':>4s} {'us':>8s} {'ns/iter':>8s} {'GB/s':>7s} {'% bw':>6s}")
     print("  (* = working set still fits L2; that row's GB/s is optimistic)\n")
     for n, k in SHAPES:
         iters = args.iters if n < 100_000 else args.iters // 8
         row = []
-        for qtype, fn in ((QT.Q4_K, matmul_q4_k), (QT.Q6_K, matmul_q6_k)):
+        for qtype in qtypes:
+            fn = KERNELS[qtype][0]
             nbytes = n * k // 256 * GGML_QUANT_SIZES[qtype][1]
             # Capped: past a point the rotation itself costs more than the
               # L2 residency it removes. A row that still fits is flagged.
@@ -104,7 +116,7 @@ def main() -> None:
             del weights
         for qtype, secs, nbytes, it, gbs, copies in row:
             ctas = (n + 7) // 8
-            print(f"{f'({n},{k})':>16s} {str(qtype).split('.')[-1]:>5s} "
+            print(f"{f'({n},{k})':>16s} {qtype.name:>6s} "
                   f"{ctas:6d} {ctas / SMS:6.1f} {nbytes / 1e6:6.0f} "
                   f"{copies:3d}{'*' if nbytes * copies < L2_BYTES else ' '}"
                   f"{secs * 1e6:8.2f} "

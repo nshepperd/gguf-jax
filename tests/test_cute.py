@@ -241,3 +241,130 @@ def test_cute_matmul_q6_k_batch_and_jit():
     yj = jax.jit(cute_mod.matmul_q6_k)(x, w)
     np.testing.assert_array_equal(
         np.asarray(y).view(np.uint16), np.asarray(yj).view(np.uint16))
+
+
+# ---------------------------------------------------------------------------
+# Q5_K fused matmul
+
+Q5_K = GGMLQuantizationType.Q5_K
+
+
+def _random_finite_q5k(n_rows, k_dim, seed):
+    """Random Q5_K blocks with finite (small) d/dmin, byte-shaped (n_rows, row_bytes)."""
+    rng = np.random.default_rng(seed)
+    nb = n_rows * k_dim // 256
+    data = rng.integers(0, 256, size=(nb, 176), dtype=np.uint8)
+    data[:, :4] = (rng.normal(size=(nb, 2)) * 0.05).astype(np.float16).view(np.uint8)
+    return data.reshape(n_rows, -1)
+
+
+# m chosen either side of the GEMV cap: 1-8 warp-GEMV, >8 dequantize-then-matmul
+@pytest.mark.parametrize("m", [1, 2, 5, 8, 40])
+def test_cute_matmul_q5_k(m):
+    n_rows, k_dim = 256, 1536
+    data = _random_finite_q5k(n_rows, k_dim, seed=m)
+    w = gguf_jax.QuantizedArray.from_bytes(data, Q5_K, shape=(n_rows, k_dim))
+    rng = np.random.default_rng(m + 100)
+    x = jnp.asarray(rng.normal(size=(m, k_dim)), dtype=jnp.bfloat16)
+
+    y = np.asarray(cute_mod.matmul_q5_k(x, w), dtype=np.float32)
+
+    wd = jnp.asarray(gguf.quants.dequantize(data, Q5_K)).astype(jnp.bfloat16)
+    ref = np.asarray(
+        (x.astype(jnp.float32) @ wd.astype(jnp.float32).T).astype(jnp.bfloat16),
+        dtype=np.float32)
+    # identical products, f32 accumulation in a different order, one bf16 round
+    np.testing.assert_allclose(y, ref, rtol=1e-2, atol=1e-2 * np.abs(ref).max())
+
+
+def test_cute_matmul_q5_k_exact_weights():
+    """One-hot x reads the dequantized weight out of the kernel column by column."""
+    n_rows, k_dim = 64, 512
+    data = _random_finite_q5k(n_rows, k_dim, seed=11)
+    w = gguf_jax.QuantizedArray.from_bytes(data, Q5_K, shape=(n_rows, k_dim))
+    ref = np.asarray(gguf.quants.dequantize(data, Q5_K).reshape(n_rows, k_dim))
+    ref_bf16 = np.asarray(jnp.asarray(ref).astype(jnp.bfloat16), dtype=np.float32)
+
+    # spread over nibble halves, fifth-bit positions, sub-block and superblock edges
+    for e in (0, 1, 3, 4, 15, 16, 31, 32, 33, 63, 64, 127, 128, 255, 256, k_dim - 1):
+        x = jnp.zeros((1, k_dim), jnp.bfloat16).at[0, e].set(jnp.bfloat16(1))
+        y = np.asarray(cute_mod.matmul_q5_k(x, w), dtype=np.float32)[0]
+        np.testing.assert_array_equal(y, ref_bf16[:, e], err_msg=f"element {e}")
+
+
+def test_cute_matmul_q5_k_batch_and_jit():
+    n_rows, k_dim = 128, 512
+    data = _random_finite_q5k(n_rows, k_dim, seed=42)
+    w = gguf_jax.QuantizedArray.from_bytes(data, Q5_K, shape=(n_rows, k_dim))
+    rng = np.random.default_rng(0)
+
+    x = jnp.asarray(rng.normal(size=(2, 3, k_dim)), dtype=jnp.bfloat16)
+    y = cute_mod.matmul_q5_k(x, w)
+    assert y.shape == (2, 3, n_rows) and y.dtype == jnp.bfloat16
+
+    yj = jax.jit(cute_mod.matmul_q5_k)(x, w)
+    np.testing.assert_array_equal(
+        np.asarray(y).view(np.uint16), np.asarray(yj).view(np.uint16))
+
+
+# ---------------------------------------------------------------------------
+# IQ4_XS fused matmul
+
+IQ4_XS = GGMLQuantizationType.IQ4_XS
+
+
+def _random_finite_iq4xs(n_rows, k_dim, seed):
+    """Random IQ4_XS blocks with a finite (small) d, byte-shaped (n_rows, row_bytes)."""
+    rng = np.random.default_rng(seed)
+    nb = n_rows * k_dim // 256
+    data = rng.integers(0, 256, size=(nb, 136), dtype=np.uint8)
+    data[:, :2] = (rng.normal(size=(nb, 1)) * 0.005).astype(np.float16).view(np.uint8)
+    return data.reshape(n_rows, -1)
+
+
+# m chosen either side of the GEMV cap: 1-8 warp-GEMV, >8 dequantize-then-matmul
+@pytest.mark.parametrize("m", [1, 2, 5, 8, 40])
+def test_cute_matmul_iq4_xs(m):
+    n_rows, k_dim = 256, 1536
+    data = _random_finite_iq4xs(n_rows, k_dim, seed=m)
+    w = gguf_jax.QuantizedArray.from_bytes(data, IQ4_XS, shape=(n_rows, k_dim))
+    rng = np.random.default_rng(m + 100)
+    x = jnp.asarray(rng.normal(size=(m, k_dim)), dtype=jnp.bfloat16)
+
+    y = np.asarray(cute_mod.matmul_iq4_xs(x, w), dtype=np.float32)
+
+    wd = jnp.asarray(gguf.quants.dequantize(data, IQ4_XS)).astype(jnp.bfloat16)
+    ref = np.asarray(
+        (x.astype(jnp.float32) @ wd.astype(jnp.float32).T).astype(jnp.bfloat16),
+        dtype=np.float32)
+    np.testing.assert_allclose(y, ref, rtol=1e-2, atol=1e-2 * np.abs(ref).max())
+
+
+def test_cute_matmul_iq4_xs_exact_weights():
+    """One-hot x reads the dequantized weight out of the kernel column by column."""
+    n_rows, k_dim = 64, 512
+    data = _random_finite_iq4xs(n_rows, k_dim, seed=11)
+    w = gguf_jax.QuantizedArray.from_bytes(data, IQ4_XS, shape=(n_rows, k_dim))
+    ref = np.asarray(gguf.quants.dequantize(data, IQ4_XS).reshape(n_rows, k_dim))
+    ref_bf16 = np.asarray(jnp.asarray(ref).astype(jnp.bfloat16), dtype=np.float32)
+
+    # the 16-element nibble split is what distinguishes this layout from Q4_K's
+    for e in (0, 1, 3, 4, 15, 16, 17, 31, 32, 33, 63, 127, 128, 255, 256, k_dim - 1):
+        x = jnp.zeros((1, k_dim), jnp.bfloat16).at[0, e].set(jnp.bfloat16(1))
+        y = np.asarray(cute_mod.matmul_iq4_xs(x, w), dtype=np.float32)[0]
+        np.testing.assert_array_equal(y, ref_bf16[:, e], err_msg=f"element {e}")
+
+
+def test_cute_matmul_iq4_xs_batch_and_jit():
+    n_rows, k_dim = 128, 512
+    data = _random_finite_iq4xs(n_rows, k_dim, seed=42)
+    w = gguf_jax.QuantizedArray.from_bytes(data, IQ4_XS, shape=(n_rows, k_dim))
+    rng = np.random.default_rng(0)
+
+    x = jnp.asarray(rng.normal(size=(2, 3, k_dim)), dtype=jnp.bfloat16)
+    y = cute_mod.matmul_iq4_xs(x, w)
+    assert y.shape == (2, 3, n_rows) and y.dtype == jnp.bfloat16
+
+    yj = jax.jit(cute_mod.matmul_iq4_xs)(x, w)
+    np.testing.assert_array_equal(
+        np.asarray(y).view(np.uint16), np.asarray(yj).view(np.uint16))
