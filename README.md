@@ -12,7 +12,8 @@ model = gguf_jax.load_gguf("llama-3.2-1b-Q4_K_M.gguf", dtype=jnp.bfloat16)
 w = model.tensors["blk.0.attn_q.weight"]   # QuantizedArray(Q4_K, shape=(2048, 2048), ...)
 
 # inside your (jitted) forward pass:
-y = x @ w.dequantize().T                   # bfloat16, decoded on the fly
+y = gguf_jax.matmul(x, w)                  # x @ w.T, fused kernel where one fits
+y = x @ w.dequantize().T                   # or decode explicitly
 ```
 
 ## Features
@@ -27,9 +28,14 @@ y = x @ w.dequantize().T                   # bfloat16, decoded on the fly
   payload as its only leaf (qtype/shape/dtype are static), so it composes with
   `jax.jit`, `tree_map`, checkpointing utilities, etc.
 - **Pluggable kernels.** `register_dequant` swaps in a faster decode for a
-  qtype. `gguf_jax.cute` ships CuTe DSL kernels for Q4_K and Q6_K, including
-  fused dequant-matmuls that keep the weights quantized in HBM — see
-  [docs/cute-kernels.md](docs/cute-kernels.md).
+  qtype. `gguf_jax.cute` ships CuTe DSL kernels for Q4_K, Q5_K, Q6_K and
+  IQ4_XS, including fused dequant-matmuls that keep the weights quantized in
+  HBM — see [docs/cute-kernels.md](docs/cute-kernels.md).
+- **One call to multiply by a quantized weight.** `gguf_jax.matmul(x, w)` picks
+  the route: a fused kernel when one covers that qtype and batch size,
+  otherwise dequantize-then-matmul, split across output rows if the weight is
+  too big to materialize at once. Callers do not need to know which kernels
+  exist or what each one's batch cap is.
 
 ## Supported quant types
 
@@ -56,8 +62,20 @@ Everything the gguf-py reference can dequantize:
 - `quantize(array, qtype)` — host-side wrapper around the gguf-py reference
   quantizer (only the types gguf-py can quantize).
 - `register_dequant(qtype, fn, override=False)` — install a custom kernel.
-- `gguf_jax.cute.register()` / `gguf_jax.cute.matmul_q4_k(x, w)` /
-  `gguf_jax.cute.matmul_q6_k(x, w)` — the optional CuTe DSL kernels.
+- `matmul(x, w, block_bytes=None, force_fused=False) -> Array` — `x @ w.T`,
+  dispatching over the available kernels. Prefer this to calling a
+  `gguf_jax.cute.matmul_*` directly: above their batch range those fall back
+  internally to dequantizing the *whole* weight, which is the allocation you
+  were trying to avoid, whereas `matmul` blocks it instead.
+- `dequant_matmul(x, w, block_bytes=None)` — the fallback on its own, for
+  benchmarking against the fused path.
+- `fused_types()` / `fused_batch_limit(w)` — which qtypes have a fused kernel
+  in this installation, and the largest batch `w` can be multiplied at without
+  being materialized (0 if none applies).
+- `GGUF_JAX_DEQUANT_BLOCK_BYTES` — env override for how large a temporary one
+  dequantize may allocate before it is split across output rows.
+- `gguf_jax.cute.register()` / `gguf_jax.cute.matmul_q4_k(x, w)` / … — the
+  optional CuTe DSL kernels, called directly.
 
 ## Development
 
