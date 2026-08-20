@@ -20,6 +20,8 @@ hardware f16->f32 convert is used instead of manual bit widening.
 """
 from __future__ import annotations
 
+import os
+
 import cutejax
 import cutlass
 import jax
@@ -115,6 +117,10 @@ def dequantize_q4_k(data: jax.Array, dtype=jnp.float32) -> jax.Array:
 _GEMV_MAX_M = 2
 _GEMM_MAX_M = 128
 
+# Which lane->element mapping the warp-GEMV uses. See _q4_k_matmul_kernel_v2;
+# set GGUF_JAX_Q4K_GEMV_V1=1 to fall back while comparing the two.
+_GEMV_V2 = os.environ.get("GGUF_JAX_Q4K_GEMV_V1", "") == ""
+
 
 @cute.kernel
 def _q4_k_matmul_kernel(gU: cute.Tensor, gW: cute.Tensor, gH: cute.Tensor,
@@ -169,6 +175,95 @@ def _q4_k_matmul_kernel(gU: cute.Tensor, gW: cute.Tensor, gH: cute.Tensor,
                 gO[m, n] = gO.element_type(v)
 
 
+# ---------------------------------------------------------------------------
+# Same GEMV, remapped so each lane owns four CONSECUTIVE qs bytes instead of
+# four bytes 32 apart.
+#
+# Profiling the original (ncu, RTX 5070 Ti, 12288x4096, M=1) put it at 78%
+# compute speed-of-light against 49% DRAM, with 59% of its instructions on the
+# ALU pipe: the kernel is bound by integer bit-surgery, not by memory. Three
+# things in the old mapping cost instructions for no bytes:
+#
+#   - lane w reads bytes {16 + 32p + w : p in 0..3}, four separate LDG.8 per
+#     superblock, each with its own address arithmetic;
+#   - the lane touches all eight 32-element sub-blocks, so it unpacks all eight
+#     (scale, min) pairs out of the three packed words;
+#   - its x elements {32k + w} are 32 apart, so they load one at a time.
+#
+# Letting lane w own qs bytes 4w..4w+3 fixes all three at once. Byte b decodes to
+# elements 64*(b>>5) + (b&31) and that plus 32, so with b = 4w + j the lane owns
+#
+#     e = 64*(w>>3) + 4*(w&7) + j   and  e + 32,   j = 0..3
+#
+# which is one LDG.32 for the quants (32 lanes x 4 bytes = the whole 128-byte qs
+# region, perfectly coalesced), exactly TWO sub-blocks per lane instead of eight,
+# and four consecutive x elements per half.
+#
+# The per-element expression is untouched -- still bf16(dl*q - dm) -- so the
+# one-hot exactness test still holds. Only which lane computes a term changes,
+# and the f32 accumulation order with it, which the docstring already disclaims.
+@cute.kernel
+def _q4_k_matmul_kernel_v2(gU: cute.Tensor, gW: cute.Tensor, gH: cute.Tensor,
+                           gX: cute.Tensor, gO: cute.Tensor,
+                           shape_u: cute.Shape, shape_x: cute.Shape,
+                           M: cutlass.Constexpr[int]):
+    tid, _, _ = cute.arch.thread_idx()
+    bid, _, _ = cute.arch.block_idx()
+    n = bid * _SB_PER_CTA + (tid >> 5)  # output row (row of W)
+    lane = tid & 31
+    grp = lane >> 3                     # which pair of sub-blocks this lane owns
+    off = (lane & 7) << 2               # first element within the 64-wide group
+
+    if n < shape_u[0]:
+        acc = cute.make_rmem_tensor(M, cutlass.Float32)
+        for m in cutlass.range_constexpr(M):
+            acc[m] = cutlass.Float32(0.0)
+
+        n_sb = shape_x[1] >> 8
+        for s in cutlass.range(n_sb):
+            d = cutlass.Float32(gH[n, s * (_BLOCK_BYTES // 2)])
+            dmin = cutlass.Float32(gH[n, s * (_BLOCK_BYTES // 2) + 1])
+            w_d = cutlass.Int32(gW[n, s * (_BLOCK_BYTES // 4) + 1])
+            w_m = cutlass.Int32(gW[n, s * (_BLOCK_BYTES // 4) + 2])
+            w_md = cutlass.Int32(gW[n, s * (_BLOCK_BYTES // 4) + 3])
+            # The quants: words 4..35 of the superblock, one per lane.
+            qw = cutlass.Int32(gW[n, s * (_BLOCK_BYTES // 4) + 4 + lane])
+
+            # Only two sub-blocks now, kk = 2*grp (low nibbles) and 2*grp + 1
+            # (high). kk < 4 for the first half of the warp and not the second,
+            # so select branchlessly rather than diverge.
+            for half in cutlass.range_constexpr(2):
+                kk = 2 * grp + half
+                jj = kk & 3
+                bd = (w_d >> (8 * jj)) & 0xFF
+                bm = (w_m >> (8 * jj)) & 0xFF
+                bmd = (w_md >> (8 * jj)) & 0xFF
+                hi_mask = -(kk >> 2)               # 0 for kk<4, -1 otherwise
+                sc = (((bd & 63) & ~hi_mask)
+                      | (((bmd & 0x0F) | ((bd >> 6) << 4)) & hi_mask))
+                mn = (((bm & 63) & ~hi_mask)
+                      | (((bmd >> 4) | ((bm >> 6) << 4)) & hi_mask))
+                dl = d * cutlass.Float32(sc)
+                dm = dmin * cutlass.Float32(mn)
+                e0 = s * QK_K + 64 * grp + 32 * half + off
+                for j in cutlass.range_constexpr(4):
+                    q = (qw >> (8 * j + 4 * half)) & 0x0F
+                    wgt = cutlass.Float32(
+                        cutlass.BFloat16(dl * cutlass.Float32(q) - dm))
+                    for m in cutlass.range_constexpr(M):
+                        acc[m] = acc[m] + wgt * cutlass.Float32(gX[m, e0 + j])
+
+        for m in cutlass.range_constexpr(M):
+            v = acc[m]
+            v = v + cute.arch.shuffle_sync_bfly(v, 16)
+            v = v + cute.arch.shuffle_sync_bfly(v, 8)
+            v = v + cute.arch.shuffle_sync_bfly(v, 4)
+            v = v + cute.arch.shuffle_sync_bfly(v, 2)
+            v = v + cute.arch.shuffle_sync_bfly(v, 1)
+            if lane == 0:
+                gO[m, n] = gO.element_type(v)
+
+
 @cute.jit
 def _q4_k_matmul_launch(stream, gU: cute.Tensor, gX: cute.Tensor, gO: cute.Tensor):
     n_rows = gU.shape[0]
@@ -179,7 +274,8 @@ def _q4_k_matmul_launch(stream, gU: cute.Tensor, gX: cute.Tensor, gO: cute.Tenso
     hptr = cute.recast_ptr(gU.iterator, dtype=cutlass.Float16)
     gH = cute.make_tensor(hptr, cute.make_layout((n_rows, row_halves), stride=(row_halves, 1)))
     n_cta = (n_rows + _SB_PER_CTA - 1) // _SB_PER_CTA
-    _q4_k_matmul_kernel(gU, gW, gH, gX, gO, gU.shape, gX.shape, gX.shape[0]).launch(
+    kernel = _q4_k_matmul_kernel_v2 if _GEMV_V2 else _q4_k_matmul_kernel
+    kernel(gU, gW, gH, gX, gO, gU.shape, gX.shape, gX.shape[0]).launch(
         grid=[n_cta, 1, 1], block=[_CTA, 1, 1], stream=stream)
 
 

@@ -127,6 +127,27 @@ def test_cute_matmul_q4_k(m):
     np.testing.assert_allclose(y, ref, rtol=1e-2, atol=1e-2 * np.abs(ref).max())
 
 
+def test_cute_matmul_q4_k_exact_weights():
+    """One-hot x reads the dequantized weight out of the kernel column by column.
+
+    This is what pins the per-element rounding: the warp-GEMV rounds each weight
+    through bf16 so a fused matmul equals `x @ w.dequantize(bf16).T`. Any change
+    to the lane->element mapping must keep it, and any change that factors the
+    scales out of the inner loop cannot.
+    """
+    n_rows, k_dim = 64, 512
+    data = _random_finite_q4k(n_rows, k_dim, seed=13)
+    w = gguf_jax.QuantizedArray.from_bytes(data, QTYPE, shape=(n_rows, k_dim))
+    ref = np.asarray(gguf.quants.dequantize(data, QTYPE)).reshape(n_rows, k_dim)
+    ref_bf16 = np.asarray(jnp.asarray(ref).astype(jnp.bfloat16), dtype=np.float32)
+
+    # Deliberately spread over nibble halves, sub-block edges and superblocks.
+    for e in (0, 1, 3, 4, 31, 32, 33, 63, 64, 127, 128, 255, 256, k_dim - 1):
+        x = jnp.zeros((1, k_dim), jnp.bfloat16).at[0, e].set(jnp.bfloat16(1))
+        y = np.asarray(cute_mod.matmul_q4_k(x, w), dtype=np.float32)[0]
+        np.testing.assert_array_equal(y, ref_bf16[:, e], err_msg=f"element {e}")
+
+
 def test_cute_matmul_q4_k_batch_and_fallback():
     n_rows, k_dim = 256, 512
     data = _random_finite_q4k(n_rows, k_dim, seed=42)

@@ -49,10 +49,30 @@ It dispatches on the flattened batch size M across three paths.
 
 ### M ≤ 2 — warp-GEMV (`q4_k.py`)
 
-One warp per output row `n` of W. Lane `w` walks the row's superblocks handling
-elements `{32k + w}`, dequantizes into registers, multiplies with `x[m, e]` and
-accumulates in float32; a butterfly-shuffle reduction folds the 32 lanes. M is
-compile-time static, so there is one specialization per batch size.
+One warp per output row `n` of W. Lane `w` walks the row's superblocks,
+dequantizes into registers, multiplies with `x[m, e]` and accumulates in
+float32; a butterfly-shuffle reduction folds the 32 lanes. M is compile-time
+static, so there is one specialization per batch size.
+
+Lane `w` owns qs bytes `4w..4w+3` — four *consecutive* bytes. Since byte `b`
+decodes to elements `64*(b>>5) + (b&31)` and that plus 32, the lane's elements
+are `e = 64*(w>>3) + 4*(w&7) + j` and `e+32` for `j` in 0..3, which is a
+permutation of the superblock.
+
+That mapping is chosen for instruction count, not for coalescing. Profiling put
+the kernel at 78% compute speed-of-light against 49% DRAM with 59% of its
+instructions on the ALU pipe: it is bound by integer bit-surgery, not by memory,
+so the thing worth minimising is work per element. Consecutive bytes buy three
+cuts at once — one `LDG.32` covers the whole 128-byte qs region (was four
+`LDG.8` at stride 32), the lane touches exactly **two** of the eight 32-element
+sub-blocks so it unpacks two `(scale, min)` pairs instead of eight, and its `x`
+elements are contiguous runs of four. Measured 1.15× on the kernel and 1.08× on
+end-to-end decode of Qwen3-VL-8B Q4_K_M, for 26% fewer instructions.
+
+The per-element expression is unchanged, so the bf16 rounding guarantee holds
+exactly (`test_cute_matmul_q4_k_exact_weights` pins it with a one-hot `x`); only
+the f32 accumulation order moves, which the contract above already disclaims.
+Set `GGUF_JAX_Q4K_GEMV_V1=1` to run the previous mapping for comparison.
 
 ### 3 ≤ M ≤ 128 — tensor-core GEMM (`q4_k_gemm.py`)
 
@@ -113,9 +133,13 @@ dense matrix never materialized.
 
 One 210-byte Q6_K superblock holds `ql` (128 B of low nibbles), `qh` (64 B of
 high bit-pairs), 16 signed int8 sub-scales and an f16 `d`; element `e` decodes
-as `(d * scales[e // 16]) * (q[e] - 32)`. The warp mapping is Q4_K's: one warp
-per output row `n`, lane `w` walking the row's superblocks over elements
-`{32c + w}` for `c` in 0..7, float32 accumulate, butterfly-shuffle reduction.
+as `(d * scales[e // 16]) * (q[e] - 32)`. One warp per output row `n`, lane `w`
+walking the row's superblocks over elements `{32c + w}` for `c` in 0..7, float32
+accumulate, butterfly-shuffle reduction — the mapping Q4_K used before its
+consecutive-byte remap. Q6_K has not had the same treatment: its 210-byte block
+is not 4-byte aligned, so the equivalent would be uint16 loads (six per
+superblock down to three) rather than Q4_K's four down to one, and Q6_K is the
+smaller share of a decode step.
 Unlike Q4_K there is no uint32 row view — 210 is not a multiple of 4 — so the
 scale bytes are read straight out of the uint8 tensor (two distinct bytes per
 warp per chunk, still coalesced); `d` comes from a float16 recast view.
