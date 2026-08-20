@@ -27,8 +27,8 @@ y = x @ w.dequantize().T                   # bfloat16, decoded on the fly
   payload as its only leaf (qtype/shape/dtype are static), so it composes with
   `jax.jit`, `tree_map`, checkpointing utilities, etc.
 - **Pluggable kernels.** `register_dequant` swaps in a faster decode for a
-  qtype. `gguf_jax.cute` ships CuTe DSL kernels for Q4_K, including a fused
-  dequant-matmul that keeps the weights quantized in HBM — see
+  qtype. `gguf_jax.cute` ships CuTe DSL kernels for Q4_K and Q6_K, including
+  fused dequant-matmuls that keep the weights quantized in HBM — see
   [docs/cute-kernels.md](docs/cute-kernels.md).
 
 ## Supported quant types
@@ -56,8 +56,8 @@ Everything the gguf-py reference can dequantize:
 - `quantize(array, qtype)` — host-side wrapper around the gguf-py reference
   quantizer (only the types gguf-py can quantize).
 - `register_dequant(qtype, fn, override=False)` — install a custom kernel.
-- `gguf_jax.cute.register()` / `gguf_jax.cute.matmul_q4_k(x, w)` — the optional
-  CuTe DSL Q4_K kernels.
+- `gguf_jax.cute.register()` / `gguf_jax.cute.matmul_q4_k(x, w)` /
+  `gguf_jax.cute.matmul_q6_k(x, w)` — the optional CuTe DSL kernels.
 
 ## Development
 

@@ -1,4 +1,4 @@
-"""Benchmark fused Q4_K matmul vs dequantize-then-matmul.
+"""Benchmark fused Q4_K / Q6_K matmul vs dequantize-then-matmul.
 
     XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async XLA_PYTHON_CLIENT_MEM_FRACTION=0.2 \
         uv run python bench/bench_matmul.py
@@ -13,7 +13,7 @@ import numpy as np
 from gguf.constants import GGMLQuantizationType
 
 import gguf_jax
-from gguf_jax.cute import matmul_q4_k
+from gguf_jax.cute import matmul_q4_k, matmul_q6_k
 
 N, K = 4096, 14336
 
@@ -59,5 +59,31 @@ def main():
               f"{t_dense*1e6:>8.0f}us   {t_unfused/t_fused:>5.1f}x")
 
 
+def main_q6():
+    rng = np.random.default_rng(0)
+    nb = N * K // 256
+    data = rng.integers(0, 256, size=(nb, 210), dtype=np.uint8)
+    data[:, 208:210] = (rng.normal(size=(nb, 1)) * 0.05).astype(np.float16).view(np.uint8)
+    w = gguf_jax.QuantizedArray.from_bytes(
+        data.reshape(N, -1), GGMLQuantizationType.Q6_K, shape=(N, K))
+
+    fused = jax.jit(matmul_q6_k)          # dispatching wrapper (GEMV or fallback)
+    unfused = jax.jit(lambda x, w: x @ w.dequantize(jnp.bfloat16).T)
+    dense_w = w.dequantize(jnp.bfloat16)
+    dense = jax.jit(lambda x, wd: x @ wd.T)
+
+    print(f"\ndevice: {jax.devices()[0].device_kind}, W: {N}x{K} Q6_K "
+          f"({data.nbytes/1e6:.0f}MB quantized, {N*K*2/1e6:.0f}MB as bf16)")
+    print(f"{'M':>4} {'fused':>9} {'unfused':>9} {'dense bf16':>10}   speedup")
+    for m in [1, 2, 4, 8, 16, 32]:
+        x = jnp.asarray(rng.normal(size=(m, K)), dtype=jnp.bfloat16)
+        t_fused = bench(fused, x, w)
+        t_unfused = bench(unfused, x, w)
+        t_dense = bench(dense, x, dense_w)
+        print(f"{m:>4} {t_fused*1e6:>7.0f}us {t_unfused*1e6:>7.0f}us "
+              f"{t_dense*1e6:>8.0f}us   {t_unfused/t_fused:>5.1f}x")
+
+
 if __name__ == "__main__":
     main()
+    main_q6()

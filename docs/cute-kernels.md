@@ -2,9 +2,9 @@
 
 The pure-JAX kernels are the reference path: dequantization expressed as plain
 XLA ops (bit twiddling + gathers + multiplies). `gguf_jax.cute` provides
-hand-written CuTe DSL kernels for Q4_K as the demonstrator that the
-[kernel contract](bitwise-correctness.md#kernel-contract) is enough to swap in
-something faster.
+hand-written CuTe DSL kernels for Q4_K (plus a fused Q6_K GEMV) as the
+demonstrator that the [kernel contract](bitwise-correctness.md#kernel-contract)
+is enough to swap in something faster.
 
 It needs the optional `cute` dependency group: nvidia-cutlass-dsl, jax-tvm-ffi
 and cutejax.
@@ -17,7 +17,7 @@ cute.register()      # Q4_K dequantize() now runs the cute kernel
 `register()` swaps the kernel in behind the normal `QuantizedArray` API, and
 the same bitwise test battery applies to it.
 
-## Dequantization kernel
+## Q4_K dequantization kernel
 
 One CTA per 8 superblocks, 32 lanes per superblock, 8 elements per lane with
 warp-coalesced stores. The f16 (`d`, `dmin`) pair and the packed scale words
@@ -37,7 +37,7 @@ dequantize only, effective bandwidth = bytes in + out over wall time):
 
 The remaining headroom (~896 GB/s peak) is scattered small stores.
 
-## Fused dequant-matmul
+## Fused Q4_K dequant-matmul
 
 `gguf_jax.cute.matmul_q4_k(x, w)` computes `x @ w.T` (`x` bfloat16 `(..., K)`,
 `w` a Q4_K `QuantizedArray` `(N, K)`) with the weights dequantized on the fly —
@@ -104,3 +104,38 @@ unfused path, and faster than a dense bf16 matmul with resident weights up to
 M ≈ 64 — the quantized bytes are simply less memory to read. Next lever: keep
 W-tile reuse across M-tiles at large M (split-K / persistent CTAs) instead of
 falling back.
+
+## Fused Q6_K matmul (GEMV only)
+
+`gguf_jax.cute.matmul_q6_k(x, w)` is the same contract for a Q6_K weight:
+`x @ w.T`, weights dequantized in registers and rounded through bfloat16, the
+dense matrix never materialized.
+
+One 210-byte Q6_K superblock holds `ql` (128 B of low nibbles), `qh` (64 B of
+high bit-pairs), 16 signed int8 sub-scales and an f16 `d`; element `e` decodes
+as `(d * scales[e // 16]) * (q[e] - 32)`. The warp mapping is Q4_K's: one warp
+per output row `n`, lane `w` walking the row's superblocks over elements
+`{32c + w}` for `c` in 0..7, float32 accumulate, butterfly-shuffle reduction.
+Unlike Q4_K there is no uint32 row view — 210 is not a multiple of 4 — so the
+scale bytes are read straight out of the uint8 tensor (two distinct bytes per
+warp per chunk, still coalesced); `d` comes from a float16 recast view.
+
+There is no tensor-core Q6_K GEMM yet, so the dispatch is two-way: warp-GEMV
+through M = 8, dequantize-then-matmul above it. The cap is higher than Q4_K's
+M ≤ 2 precisely because nothing better competes in that range — the GEMV is
+still ahead of the fallback at M = 8.
+
+`bench/bench_matmul.py`, 4096×14336 Q6_K weight (48MB quantized, 117MB dense):
+
+| M  | fused (dispatch) | unfused  | dense bf16 matmul |
+|----|------------------|----------|-------------------|
+| 1  |  66 µs (gemv)    | 357 µs   | 151 µs            |
+| 2  |  92 µs (gemv)    | 347 µs   | 148 µs            |
+| 4  | 163 µs (gemv)    | 350 µs   | 148 µs            |
+| 8  | 244 µs (gemv)    | 342 µs   | 148 µs            |
+| 16 | 346 µs (unfused) | 346 µs   | 150 µs            |
+
+At M = 1 that is 676 GB/s of quantized weight read — 5.4× the unfused path,
+and 2.3× faster than a dense bf16 matmul with the weights already resident.
+The obvious next step is a Q6_K B-operand for the tensor-core GEMM, which
+would flatten M = 3..128 the way it does for Q4_K.

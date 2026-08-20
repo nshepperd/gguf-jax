@@ -157,3 +157,66 @@ def test_cute_bf16_output_matches_cast():
     via_cast = cute_mod.dequantize_q4_k(jnp.asarray(data), dtype=jnp.float32).astype(jnp.bfloat16)
     np.testing.assert_array_equal(
         np.asarray(via_cute).view(np.uint16), np.asarray(via_cast).view(np.uint16))
+
+
+# ---------------------------------------------------------------------------
+# Q6_K fused matmul
+
+Q6_K = GGMLQuantizationType.Q6_K
+
+
+def _random_finite_q6k(n_rows, k_dim, seed):
+    """Random Q6_K blocks with a finite (small) d, byte-shaped (n_rows, row_bytes)."""
+    rng = np.random.default_rng(seed)
+    nb = n_rows * k_dim // 256
+    data = rng.integers(0, 256, size=(nb, 210), dtype=np.uint8)
+    data[:, 208:210] = (rng.normal(size=(nb, 1)) * 0.05).astype(np.float16).view(np.uint8)
+    return data.reshape(n_rows, -1)
+
+
+# m chosen either side of the GEMV cap: 1-8 warp-GEMV, >8 dequantize-then-matmul
+@pytest.mark.parametrize("m", [1, 2, 5, 8, 40])
+def test_cute_matmul_q6_k(m):
+    n_rows, k_dim = 256, 1536
+    data = _random_finite_q6k(n_rows, k_dim, seed=m)
+    w = gguf_jax.QuantizedArray.from_bytes(data, Q6_K, shape=(n_rows, k_dim))
+    rng = np.random.default_rng(m + 100)
+    x = jnp.asarray(rng.normal(size=(m, k_dim)), dtype=jnp.bfloat16)
+
+    y = np.asarray(cute_mod.matmul_q6_k(x, w), dtype=np.float32)
+
+    wd = jnp.asarray(gguf.quants.dequantize(data, Q6_K)).astype(jnp.bfloat16)
+    ref = np.asarray(
+        (x.astype(jnp.float32) @ wd.astype(jnp.float32).T).astype(jnp.bfloat16),
+        dtype=np.float32)
+    # identical products, f32 accumulation in a different order, one bf16 round
+    np.testing.assert_allclose(y, ref, rtol=1e-2, atol=1e-2 * np.abs(ref).max())
+
+
+def test_cute_matmul_q6_k_exact_weights():
+    """One-hot x reads the dequantized weight out of the kernel column by column."""
+    n_rows, k_dim = 64, 512
+    data = _random_finite_q6k(n_rows, k_dim, seed=11)
+    w = gguf_jax.QuantizedArray.from_bytes(data, Q6_K, shape=(n_rows, k_dim))
+    ref = np.asarray(gguf.quants.dequantize(data, Q6_K).reshape(n_rows, k_dim))
+    ref_bf16 = np.asarray(jnp.asarray(ref).astype(jnp.bfloat16), dtype=np.float32)
+
+    for e in (0, 1, 17, 31, 32, 100, 255, 256, k_dim - 1):
+        x = jnp.zeros((1, k_dim), jnp.bfloat16).at[0, e].set(jnp.bfloat16(1))
+        y = np.asarray(cute_mod.matmul_q6_k(x, w), dtype=np.float32)[0]
+        np.testing.assert_array_equal(y, ref_bf16[:, e])
+
+
+def test_cute_matmul_q6_k_batch_and_jit():
+    n_rows, k_dim = 128, 512
+    data = _random_finite_q6k(n_rows, k_dim, seed=42)
+    w = gguf_jax.QuantizedArray.from_bytes(data, Q6_K, shape=(n_rows, k_dim))
+    rng = np.random.default_rng(0)
+
+    x = jnp.asarray(rng.normal(size=(2, 3, k_dim)), dtype=jnp.bfloat16)
+    y = cute_mod.matmul_q6_k(x, w)
+    assert y.shape == (2, 3, n_rows) and y.dtype == jnp.bfloat16
+
+    yj = jax.jit(cute_mod.matmul_q6_k)(x, w)
+    np.testing.assert_array_equal(
+        np.asarray(y).view(np.uint16), np.asarray(yj).view(np.uint16))

@@ -6,5 +6,6 @@ cute implementations for the qtypes that have one.
 """
 from .q4_k import dequantize_q4_k, matmul_q4_k, register
 from .q4_k_gemm import gemm_q4_k
+from .q6_k import matmul_q6_k
 
-__all__ = ["dequantize_q4_k", "gemm_q4_k", "matmul_q4_k", "register"]
+__all__ = ["dequantize_q4_k", "gemm_q4_k", "matmul_q4_k", "matmul_q6_k", "register"]
