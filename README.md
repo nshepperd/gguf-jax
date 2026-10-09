@@ -30,7 +30,9 @@ y = x @ w.dequantize().T                   # or decode explicitly
 - **Pluggable kernels.** `register_dequant` swaps in a faster decode for a
   qtype. `gguf_jax.cute` ships CuTe DSL kernels for Q4_K, Q5_K, Q6_K and
   IQ4_XS, including fused dequant-matmuls that keep the weights quantized in
-  HBM — see [docs/cute-kernels.md](docs/cute-kernels.md).
+  HBM, plus one fused GEMV template covering the low-bit types (Q2_K, IQ1_S,
+  IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S) — see
+  [docs/cute-kernels.md](docs/cute-kernels.md).
 - **One call to multiply by a quantized weight.** `gguf_jax.matmul(x, w)` picks
   the route: a fused kernel when one covers that qtype and batch size,
   otherwise dequantize-then-matmul, split across output rows if the weight is
@@ -75,7 +77,8 @@ Everything the gguf-py reference can dequantize:
 - `GGUF_JAX_DEQUANT_BLOCK_BYTES` — env override for how large a temporary one
   dequantize may allocate before it is split across output rows.
 - `gguf_jax.cute.register()` / `gguf_jax.cute.matmul_q4_k(x, w)` / … — the
-  optional CuTe DSL kernels, called directly.
+  optional CuTe DSL kernels, called directly. `matmul_lowbit(x, w)` takes any
+  of `gguf_jax.cute.LOWBIT_TYPES`.
 
 ## Development
 

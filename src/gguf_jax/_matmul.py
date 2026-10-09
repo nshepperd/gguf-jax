@@ -48,7 +48,7 @@ FusedEntry = tuple[Callable[..., jax.Array], Callable[[QuantizedArray], int]]
 def _fused() -> dict[QT, FusedEntry]:
     """Whichever cute kernels are importable. Empty without the cute extra."""
     try:
-        from .cute import iq4_xs, q4_k, q5_k, q6_k
+        from .cute import iq4_xs, lowbit, q4_k, q5_k, q6_k
     except ImportError:
         return {}
 
@@ -65,6 +65,8 @@ def _fused() -> dict[QT, FusedEntry]:
         QT.Q5_K: (q5_k.matmul_q5_k, lambda w: q5_k._GEMV_MAX_M),
         QT.Q6_K: (q6_k.matmul_q6_k, lambda w: q6_k._GEMV_MAX_M),
         QT.IQ4_XS: (iq4_xs.matmul_iq4_xs, lambda w: iq4_xs._GEMV_MAX_M),
+        **{qt: (lowbit.matmul_lowbit, lambda w: lowbit._GEMV_MAX_M)
+           for qt in lowbit.LOWBIT_TYPES},
     }
 
 

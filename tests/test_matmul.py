@@ -17,6 +17,10 @@ from gguf_jax import _matmul as mm
 
 ON_GPU = jax.devices()[0].platform == "gpu"
 
+# Low-bit types whose f16 super-scale is the first two bytes of the block.
+LOWBIT_D_FIRST = (QT.IQ2_XXS, QT.IQ2_XS, QT.IQ2_S, QT.IQ3_XXS, QT.IQ3_S, QT.IQ1_S)
+FUSED = [QT.Q4_K, QT.Q5_K, QT.Q6_K, QT.IQ4_XS, QT.Q2_K, QT.IQ1_M, *LOWBIT_D_FIRST]
+
 
 def make_weight(n, k, qtype, seed=0):
     """Random blocks with small finite super-scales, so nothing overflows."""
@@ -29,7 +33,16 @@ def make_weight(n, k, qtype, seed=0):
         data[:, :4] = scale                 # d, dmin
     elif qtype == QT.Q6_K:
         data[:, 208:210] = scale[:, :2]     # d
-    elif qtype == QT.IQ4_XS:
+    elif qtype == QT.Q2_K:
+        data[:, 80:84] = scale              # d, dmin
+    elif qtype == QT.IQ1_M:
+        # d is split across the top nibbles of the four scale words
+        bits = scale[:, :2].copy().view(np.uint16)[:, 0]
+        words = data[:, 48:56].copy().view(np.uint16)
+        for j in range(4):
+            words[:, j] = (words[:, j] & 0x0FFF) | (((bits >> (4 * j)) & 0xF) << 12)
+        data[:, 48:56] = words.view(np.uint8)
+    elif qtype in (QT.IQ4_XS, *LOWBIT_D_FIRST):
         data[:, :2] = scale[:, :2]          # d
     return gguf_jax.QuantizedArray.from_bytes(
         data.reshape(n, -1), qtype, shape=(n, k))
@@ -98,11 +111,11 @@ pytestmark_gpu = pytest.mark.skipif(
 @pytestmark_gpu
 def test_fused_types_are_registered():
     pytest.importorskip("gguf_jax.cute")
-    assert set(mm.fused_types()) >= {QT.Q4_K, QT.Q5_K, QT.Q6_K, QT.IQ4_XS}
+    assert set(mm.fused_types()) >= set(FUSED)
 
 
 @pytestmark_gpu
-@pytest.mark.parametrize("qtype", [QT.Q4_K, QT.Q5_K, QT.Q6_K, QT.IQ4_XS])
+@pytest.mark.parametrize("qtype", FUSED, ids=lambda t: t.name)
 def test_fused_agrees_with_fallback(qtype):
     """Whichever route dispatch picks, the answer is the same one."""
     pytest.importorskip("gguf_jax.cute")
@@ -117,7 +130,7 @@ def test_fused_agrees_with_fallback(qtype):
 
 
 @pytestmark_gpu
-@pytest.mark.parametrize("qtype", [QT.Q4_K, QT.Q5_K, QT.Q6_K, QT.IQ4_XS])
+@pytest.mark.parametrize("qtype", FUSED, ids=lambda t: t.name)
 def test_every_fused_type_has_a_usable_batch_range(qtype):
     pytest.importorskip("gguf_jax.cute")
     w = make_weight(256, 512, qtype)

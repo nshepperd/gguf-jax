@@ -30,10 +30,17 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType as QT
+from gguf.constants import GGML_QUANT_SIZES
+from gguf.constants import GGMLQuantizationType as QT
 
 import gguf_jax
-from gguf_jax.cute import matmul_iq4_xs, matmul_q4_k, matmul_q5_k, matmul_q6_k
+from gguf_jax.cute import (
+    matmul_iq4_xs,
+    matmul_lowbit,
+    matmul_q4_k,
+    matmul_q5_k,
+    matmul_q6_k,
+)
 
 SMS = 70            # RTX 5070 Ti; only used to report wave count
 L2_BYTES = 48 << 20  # GB203; weights below this would be timed out of cache
@@ -47,6 +54,17 @@ SHAPES = [
     (151936, 4096),   # lm_head
 ]
 
+# Underdog Saluki 27B (qwen35, IQ2-mix): the shapes its low-bit weights take.
+SALUKI_SHAPES = [
+    (1024, 5120),     # attn_k, attn_v
+    (5120, 6144),     # attn_output, ssm_out
+    (6144, 5120),     # attn_gate
+    (10240, 5120),    # attn_qkv
+    (17408, 5120),    # ffn_gate, ffn_up
+    (5120, 17408),    # ffn_down
+    (248320, 5120),   # output
+]
+
 
 # qtype -> (kernel, byte slice holding the f16 super-scale(s))
 KERNELS = {
@@ -54,6 +72,16 @@ KERNELS = {
     QT.Q5_K: (matmul_q5_k, slice(0, 4)),      # d, dmin
     QT.Q6_K: (matmul_q6_k, slice(208, 210)),  # d
     QT.IQ4_XS: (matmul_iq4_xs, slice(0, 2)),  # d
+    QT.Q2_K: (matmul_lowbit, slice(80, 84)),   # d, dmin
+    QT.IQ2_XXS: (matmul_lowbit, slice(0, 2)),
+    QT.IQ2_XS: (matmul_lowbit, slice(0, 2)),
+    QT.IQ2_S: (matmul_lowbit, slice(0, 2)),
+    QT.IQ3_XXS: (matmul_lowbit, slice(0, 2)),
+    QT.IQ3_S: (matmul_lowbit, slice(0, 2)),
+    QT.IQ1_S: (matmul_lowbit, slice(0, 2)),
+    # IQ1_M's d is split over nibbles; random bytes there can decode to inf,
+    # which does not change the kernel's timing
+    QT.IQ1_M: (matmul_lowbit, slice(0, 0)),
 }
 
 
@@ -90,15 +118,23 @@ def main() -> None:
                    help="achievable GB/s, for the last column")
     p.add_argument("--types", default="q4_k,q5_k,q6_k,iq4_xs",
                    help="comma-separated qtypes to run")
+    p.add_argument("--saluki", action="store_true",
+                   help="Saluki 27B's shapes instead of Qwen3-VL-8B's")
     args = p.parse_args()
     qtypes = [QT[t.strip().upper()] for t in args.types.split(",")]
 
     rng = np.random.default_rng(0)
+    # Bring the clocks up first: from idle, the first ~100 ms of short kernels
+    # run well below boost, which made back-to-back runs disagree by 40%.
+    spin = jnp.ones((4096, 4096), jnp.bfloat16)
+    for _ in range(200):
+        spin = (spin @ spin) * 1e-3
+    spin.block_until_ready()
     print(f"{jax.devices()[0].device_kind}, M={args.batch}\n")
     print(f"{'shape':>16s} {'type':>6s} {'CTAs':>6s} {'waves':>6s} {'MB':>6s} "
           f"{'x':>4s} {'us':>8s} {'ns/iter':>8s} {'GB/s':>7s} {'% bw':>6s}")
     print("  (* = working set still fits L2; that row's GB/s is optimistic)\n")
-    for n, k in SHAPES:
+    for n, k in (SALUKI_SHAPES if args.saluki else SHAPES):
         iters = args.iters if n < 100_000 else args.iters // 8
         row = []
         for qtype in qtypes:

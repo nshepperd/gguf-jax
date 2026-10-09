@@ -163,3 +163,88 @@ At M = 1 that is 676 GB/s of quantized weight read — 5.4× the unfused path,
 and 2.3× faster than a dense bf16 matmul with the weights already resident.
 The obvious next step is a Q6_K B-operand for the tensor-core GEMM, which
 would flatten M = 3..128 the way it does for Q4_K.
+
+## Low-bit fused GEMV (`lowbit.py`)
+
+`gguf_jax.cute.matmul_lowbit(x, w)` covers the types a ~2-bit mixed GGUF is
+built from — Q2_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S
+(`LOWBIT_TYPES`) — with **one kernel template and a small decoder per type**.
+`gguf_jax.matmul` routes all eight to it. It was written for Underdog Saluki
+27B (a GSQ-RCO IQ2-mix of Qwen3.8-27B, 7.89 GB), where each layer's tensors use
+a different one of these types, and before this only 2% of the file's bytes
+had a fused kernel.
+
+### Numerics: a different contract
+
+Unlike the kernels above, these do **not** round each weight through bf16.
+Each lane computes `t = Σ qᵢ·xᵢ` over its eight elements with `qᵢ` the
+*integer-valued* quant (signed grid value; `8·(grid ± 1/8)` for IQ1), then
+`acc += scale · t` once per sub-block. Every `qᵢ·xᵢ` is exact in float32, so
+the result is closer to the exact product than `x @ w.dequantize(bf16).T` —
+`test_cute_matmul_lowbit_accuracy` asserts exactly that — but not bitwise
+equal to it. With a one-hot `x` the output is the float32 reference weight
+rounded once to bf16, bitwise (`test_cute_matmul_lowbit_exact_weights`).
+
+### Template
+
+- **Mapping.** One warp per output row; lane `w` owns elements `8w..8w+7` of
+  each superblock. For every type these sit inside one scale group, so a lane
+  needs one scale per superblock, one 16-byte `x` load per batch row, and one
+  8-byte grid entry (IQ1/IQ2) or two 4-byte ones (IQ3).
+- **Inner loop.** Quants are built as packed bf16 pairs and fed to
+  `fma.rn.f32.bf16` (`FHFMA.BF16`, sm_100+), which multiplies bf16 *halves* —
+  `.H1` operands included — into a float32. Nothing is unpacked to f32. The
+  pairs come from a single `prmt` each: for IQ1/IQ2, whose grids use only three
+  values, the shared-memory grid holds per element the `prmt` nibbles that pick
+  a bf16 out of two value registers; for IQ3/Q2_K the table holds raw bytes,
+  `prmt` puts them under a `0x43` high byte (bf16 `128 + v`), and one
+  `sub.bf16x2` takes the 128 off exactly. Signs cost an `imad` + `lop3` per
+  pair: `(signbyte · Cₚ) & 0x80008000` lands two sign bits on the two bf16 sign
+  bits.
+- **Staging.** A low-bit superblock is only 50–110 bytes, so one superblock in
+  flight per warp leaves DRAM latency exposed — the first version's stalls
+  were ~85% `long_scoreboard`. Each warp instead copies a chunk of 3–8
+  superblocks into its own 512-byte shared-memory window with one 16-byte load
+  and store per lane, prefetching the next chunk (across row boundaries) while
+  decoding the current one. Rows are only 2-byte aligned, so the window starts
+  at the aligned address below the chunk and the offset rides along. The chunk
+  size divides the row's superblock count where it can, because the chunk body
+  is straight-line code and an empty slot would still issue a full decode.
+- **Persistence.** Grids (1–16 KB) are filled once per CTA, and the grid is a
+  fixed, fully resident 4 CTAs/SM (`min_blocks_per_mp`) striding over row
+  blocks — otherwise IQ1's 16 KB table would cost more L2 reads than the
+  weight.
+
+### Performance
+
+`bench/gemv_shapes.py --saluki`, RTX 5070 Ti, M = 1, rotating weights so they
+come from DRAM; µs per call, with GB/s of quantized weight:
+
+| type    | (17408, 5120) ffn_up | (5120, 17408) ffn_down | (248320, 5120) output |
+|---------|----------------------|------------------------|-----------------------|
+| Q2_K    |  41 µs, 716 GB/s     |  46 µs, 636 GB/s       | 520 µs, 803 GB/s      |
+| IQ2_XXS |  40 µs, 574 GB/s     |  46 µs, 499 GB/s       | 491 µs, 668 GB/s      |
+| IQ2_XS  |  39 µs, 658 GB/s     |  39 µs, 656 GB/s       | 483 µs, 761 GB/s      |
+| IQ2_S   |  43 µs, 669 GB/s     |  43 µs, 667 GB/s       | 508 µs, 801 GB/s      |
+| IQ3_XXS |  46 µs, 747 GB/s     |  50 µs, 688 GB/s       | 616 µs, 790 GB/s      |
+| IQ3_S   |  52 µs, 732 GB/s     |  53 µs, 721 GB/s       | 660 µs, 827 GB/s      |
+| IQ1_S   |  38 µs, 457 GB/s     |  43 µs, 401 GB/s       | 475 µs, 523 GB/s      |
+| IQ1_M   |  44 µs, 440 GB/s     |  50 µs, 388 GB/s       | 557 µs, 499 GB/s      |
+| *IQ4_XS (`iq4_xs.py`)* | *90 µs, 524 GB/s* | *100 µs, 472 GB/s* | *1150 µs, 587 GB/s* |
+
+Against dequantize-then-matmul at (17408, 5120) that is 14–17× at M = 1, and
+still 1.8–2.7× at the M = 12 cap; Q2_K breaks even around M = 16.
+
+The 3-bit types are at DRAM bandwidth. The 2-bit and especially the 1-bit
+ones are not: per byte of weight they decode more elements, and ncu puts them
+against the load/store pipe (~70%) and instruction issue (~75%) about equally,
+with memory stalls gone. The per-superblock budget is ~6 LSU instructions
+(four field reads, one grid lookup, one `x` load) and ~45 instructions in
+all; getting the 2-bit types to DRAM speed means cutting both by roughly a
+third — reusing each `x` load across two rows per warp, and fewer, wider
+field reads, are the obvious candidates.
+
+Two DSL details that cost time to find: converting a `Uint8`/`Uint16` element
+to `Int32` *sign*-extends (`LDS.S8`), so every narrow field read is masked;
+and bf16x2 arithmetic takes no immediates, so `sub.bf16x2`'s constant lives in
+a register inside the inline asm.
