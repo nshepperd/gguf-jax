@@ -450,13 +450,31 @@ def test_cute_matmul_lowbit_many_rows_per_warp(qtype):
     """More rows than the persistent grid has warps: the cross-row prefetch,
     and chunks where a row is shorter than one chunk (K = 2 superblocks)."""
     n_sm = jax.devices()[0].core_count
-    n_rows = n_sm * cute_mod.lowbit._CTAS_PER_SM * 8 * 2 + 37
+    n_rows = n_sm * cute_mod.lowbit._ctas_per_sm(cute_mod.lowbit._cc()) * 8 * 2 + 37
     for k_dim in (512, 1280):
         w, ref = _lowbit_weight(qtype, n_rows, k_dim, seed=k_dim)
         x = jnp.asarray(np.random.default_rng(1).normal(size=(3, k_dim)), jnp.bfloat16)
         y = np.asarray(cute_mod.matmul_lowbit(x, w), dtype=np.float64)
         exact = np.asarray(x, dtype=np.float64) @ ref.astype(np.float64).T
         np.testing.assert_allclose(y, exact, rtol=1e-2, atol=1e-2 * np.abs(exact).max())
+
+
+@pytest.mark.skipif(cute_mod.lowbit._cc() < 100, reason="needs sm_100+ for the bf16 path")
+@pytest.mark.parametrize("qtype", LOWBIT, ids=lambda t: t.name)
+def test_cute_matmul_lowbit_sm80_path_is_bitwise_sm100_path(qtype, monkeypatch):
+    """The pre-sm_100 instructions (unpack to f32 + FFMA, fma.bf16x2 for the
+    magic bytes) give bitwise the sm_100 result, so on a newer GPU this also
+    covers the code an Ampere card runs."""
+    n_rows, k_dim = 96, 11 * 256
+    w, _ = _lowbit_weight(qtype, n_rows, k_dim, seed=3)
+    rng = np.random.default_rng(9)
+    for m in (1, 5, cute_mod.lowbit._GEMV_MAX_M):
+        x = jnp.asarray(rng.normal(size=(m, k_dim)), jnp.bfloat16)
+        y = np.asarray(cute_mod.matmul_lowbit(x, w)).view(np.uint16)
+        with monkeypatch.context() as mp:
+            mp.setattr(cute_mod.lowbit, "_cc", lambda: 86)
+            y32 = np.asarray(cute_mod.matmul_lowbit(x, w)).view(np.uint16)
+        np.testing.assert_array_equal(y32, y, err_msg=f"M={m}")
 
 
 def test_cute_matmul_lowbit_batch_jit_and_fallback():

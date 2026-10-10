@@ -40,6 +40,13 @@ Signs (IQ2/IQ3) are one ``imad`` + one ``lop3`` per pair: ``(sb * C_p) &
 0x80008000`` lands sign bits 2p and 2p+1 on the two bf16 sign bits, because the
 two shifted copies of the 8-bit sign byte never overlap.
 
+**Before sm_100** (Ampere, Ada, Hopper) there is no ``fma.f32.bf16``. The
+pairs are built the same way, then each is unpacked to two float32s (one
+``shl``, one ``and``; q once per superblock, x once per batch row) and
+multiplied with plain FFMA. Products are exact and the adds round in the same
+order, so the result is bitwise the sm_100 one. Before sm_90 ``sub.bf16x2``
+is missing too and the magic-byte bias comes off with ``fma.bf16x2`` instead.
+
 **Memory.** A ~2-bit superblock is only 50-110 bytes, so one superblock per
 warp in flight is nowhere near enough bytes outstanding to cover DRAM latency
 (the first version spent most of its stalls waiting on exactly that). Weight
@@ -76,6 +83,11 @@ QK_K = 256
 _ROWS_PER_CTA = 8     # warps per CTA, one output row each
 _CTA = 256
 _CTAS_PER_SM = 4      # persistent grid size; 5 and 6 measured slower
+# Before sm_100 the float32 inner loop holds more live values, and under the
+# register cap 4 CTAs/SM implies (64) it falls apart at large M: on a 3090 at
+# (17408, 5120), M=12, Q2_K takes 790 us at 4 against 362 at 2. 2 is within 2%
+# of the best at every M there.
+_CTAS_PER_SM_SM80 = 2
 _STAGE_BYTES = 512    # weight bytes staged per warp per chunk: 16 per lane
 
 # Measured on an RTX 5070 Ti at (17408, 5120), against dequantize-then-matmul:
@@ -93,10 +105,18 @@ def _prmt(a, b, sel):
                       write_only_types=[cutlass.Int32], read_only_args=[a, b, sel])
 
 
-def _sub_128(a):
-    """bf16x2 (128 + v) -> v, exactly. bf16x2 arithmetic takes no immediates."""
+def _sub_128(a, cc):
+    """bf16x2 (128 + v) -> v, exactly. bf16x2 arithmetic takes no immediates.
+
+    ``sub.bf16x2`` is sm_90+; before that it is ``a * 1 - 128``, also exact
+    and also one HFMA2.BF16 once the hoisted 1.0 pair is in a register."""
+    if cc >= 90:
+        return inline_ptx(
+            "{ .reg .b32 k; mov.b32 k, 0x43004300; sub.rn.bf16x2 {$w0}, {$r0}, k; }",
+            write_only_types=[cutlass.Int32], read_only_args=[a])
     return inline_ptx(
-        "{ .reg .b32 k; mov.b32 k, 0x43004300; sub.rn.bf16x2 {$w0}, {$r0}, k; }",
+        "{ .reg .b32 o, k; mov.b32 o, 0x3F803F80; mov.b32 k, 0xC300C300;"
+        " fma.rn.bf16x2 {$w0}, {$r0}, o, k; }",
         write_only_types=[cutlass.Int32], read_only_args=[a])
 
 
@@ -132,6 +152,60 @@ def _dot8(q, x):
                       read_only_args=[q[0], q[1], q[2], q[3], x[0], x[1], x[2], x[3]])
 
 
+# The pre-sm_100 inner loop: no fma.f32.bf16, so each bf16 pair is unpacked to
+# two float32s (a bf16 is the top half of the float32 with the same value) and
+# multiplied with plain FFMA. Every product is exact either way and each add
+# rounds once, in the same order, so the result is bitwise the same as _dot8's.
+
+def _unpack(w):
+    """bf16x2 word -> [lo, hi] as two exact float32s, one SHL + one LOP each."""
+    lo, hi = inline_ptx("shl.b32 {$w0}, {$r0}, 16; and.b32 {$w1}, {$r0}, 0xFFFF0000;",
+                        write_only_types=[cutlass.Float32, cutlass.Float32],
+                        read_only_args=[w])
+    return [lo, hi]
+
+
+def _unpack8(words):
+    return [f for w in words for f in _unpack(w)]
+
+
+_DOT8_F32_PTX = (
+    "{ .reg .f32 t;"
+    " fma.rn.f32 t, {$r0}, {$r8}, 0f00000000;"
+    " fma.rn.f32 t, {$r1}, {$r9}, t; fma.rn.f32 t, {$r2}, {$r10}, t;"
+    " fma.rn.f32 t, {$r3}, {$r11}, t; fma.rn.f32 t, {$r4}, {$r12}, t;"
+    " fma.rn.f32 t, {$r5}, {$r13}, t; fma.rn.f32 t, {$r6}, {$r14}, t;"
+    " fma.rn.f32 {$w0}, {$r7}, {$r15}, t; }"
+)
+
+
+def _dot8_f32(q, x):
+    """sum of 8 float32 products, in _dot8's order."""
+    return inline_ptx(_DOT8_F32_PTX, write_only_types=[cutlass.Float32],
+                      read_only_args=[*q, *x])
+
+
+_SUM8_F32_PTX = (
+    "{ .reg .f32 t;"
+    " add.rn.f32 t, {$r0}, 0f00000000; add.rn.f32 t, {$r1}, t;"
+    " add.rn.f32 t, {$r2}, t; add.rn.f32 t, {$r3}, t; add.rn.f32 t, {$r4}, t;"
+    " add.rn.f32 t, {$r5}, t; add.rn.f32 t, {$r6}, t; add.rn.f32 {$w0}, {$r7}, t; }"
+)
+
+
+def _sum8_f32(x):
+    """_dot8 against all-ones, without the multiplies (``x + 0`` included,
+    which turns -0 into +0 exactly as the fma chain does)."""
+    return inline_ptx(_SUM8_F32_PTX, write_only_types=[cutlass.Float32], read_only_args=x)
+
+
+@functools.cache
+def _cc() -> int:
+    """The GPU's compute capability as an integer: 86 for sm_86, 120 for sm_120."""
+    major, minor = jax.devices()[0].compute_capability.split(".")
+    return 10 * int(major) + int(minor)
+
+
 def _bf16_bits(v: float) -> int:
     return int(np.array(v, np.float32).view(np.uint32)) >> 16
 
@@ -164,10 +238,10 @@ def _select_pairs(v0, v1, w0, w1):
             _prmt(v0, v1, w1), _prmt(v0, v1, w1 >> 16)]
 
 
-def _magic_pairs(word):
+def _magic_pairs(word, cc):
     """Four byte values (< 128) -> two exact bf16 pairs."""
-    return [_sub_128(_prmt(word, _C43, 0x4140)),
-            _sub_128(_prmt(word, _C43, 0x4342))]
+    return [_sub_128(_prmt(word, _C43, 0x4140), cc),
+            _sub_128(_prmt(word, _C43, 0x4342), cc)]
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +295,7 @@ _IQ1_SLOTS_POS = (_pack2(-7.0, 1.0), _pack2(9.0, 0.0))
 _IQ1_SLOTS_NEG = (_pack2(-9.0, -1.0), _pack2(7.0, 0.0))
 
 
-def _decode_iq2_xxs(b, w, t):
+def _decode_iq2_xxs(b, w, t, cc):
     ib, l = w >> 2, w & 3
     idx = b.u8(2 + 8 * ib + l)
     aux = b.u32(6 + 8 * ib)
@@ -233,7 +307,7 @@ def _decode_iq2_xxs(b, w, t):
     return db, _apply_signs(q, sb), None
 
 
-def _decode_iq2_xs(b, w, t):
+def _decode_iq2_xs(b, w, t, cc):
     qv = b.u16(2 + 2 * w)
     sc = (b.u8(66 + (w >> 2)) >> (4 * ((w >> 1) & 1))) & 0xF
     db = _scale_iq2(b.f16(0), sc)
@@ -244,7 +318,7 @@ def _decode_iq2_xs(b, w, t):
     return db, _apply_signs(q, sb), None
 
 
-def _decode_iq2_s(b, w, t):
+def _decode_iq2_s(b, w, t, cc):
     idx = b.u8(2 + w) | (((b.u8(66 + (w >> 2)) >> (2 * (w & 3))) & 3) << 8)
     sc = (b.u8(74 + (w >> 2)) >> (4 * ((w >> 1) & 1))) & 0xF
     db = _scale_iq2(b.f16(0), sc)
@@ -254,25 +328,25 @@ def _decode_iq2_s(b, w, t):
     return db, _apply_signs(q, b.u8(34 + w)), None
 
 
-def _decode_iq3_xxs(b, w, t):
+def _decode_iq3_xxs(b, w, t, cc):
     ib, l = w >> 2, w & 3
     iq = b.u16(2 + 2 * w)                 # the lane's two 4-element grid indices
     aux = b.u32(66 + 4 * ib)
     db = (b.f16(0) * (cutlass.Float32(0.5) + cutlass.Float32((aux >> 28) & 0xF))
           * cutlass.Float32(0.5))
     sb = _ksigns((aux >> (7 * l)) & 0x7F)
-    q = _magic_pairs(t[iq & 0xFF]) + _magic_pairs(t[iq >> 8])
+    q = _magic_pairs(t[iq & 0xFF], cc) + _magic_pairs(t[iq >> 8], cc)
     return db, _apply_signs(q, sb), None
 
 
-def _decode_iq3_s(b, w, t):
+def _decode_iq3_s(b, w, t, cc):
     iq = b.u16(2 + 2 * w)
     hb = b.u8(66 + (w >> 2)) >> (2 * (w & 3))
     i0 = (iq & 0xFF) | ((hb & 1) << 8)
     i1 = (iq >> 8) | (((hb >> 1) & 1) << 8)
     sc = (b.u8(106 + (w >> 3)) >> (4 * ((w >> 2) & 1))) & 0xF
     db = b.f16(0) * cutlass.Float32(1 + 2 * sc)
-    q = _magic_pairs(t[i0]) + _magic_pairs(t[i1])
+    q = _magic_pairs(t[i0], cc) + _magic_pairs(t[i1], cc)
     return db, _apply_signs(q, b.u8(74 + w)), None
 
 
@@ -284,7 +358,7 @@ def _iq1_pairs(e, neg):
     return _select_pairs(v0, v1, cutlass.Int32(e), cutlass.Int32(e >> 32))
 
 
-def _decode_iq1_s(b, w, t):
+def _decode_iq1_s(b, w, t, cc):
     qh = b.u16(34 + 2 * (w >> 2))
     idx = b.u8(2 + w) | (((qh >> (3 * (w & 3))) & 7) << 8)
     dl = b.f16(0) * cutlass.Float32(2 * ((qh >> 12) & 7) + 1)
@@ -292,7 +366,7 @@ def _decode_iq1_s(b, w, t):
     return dl * cutlass.Float32(0.125), q, None
 
 
-def _decode_iq1_m(b, w, t):
+def _decode_iq1_m(b, w, t, cc):
     # the four scale words as two LDS.32 (IQ1_M blocks are word-aligned)
     lo, hi = b.u32(48), b.u32(52)
     # d is split across the top nibbles of the four scale words
@@ -308,7 +382,7 @@ def _decode_iq1_m(b, w, t):
     return dl * cutlass.Float32(0.125), q, None
 
 
-def _decode_q2_k(b, w, t):
+def _decode_q2_k(b, w, t, cc):
     # element 8w+j is (qs[32h + 8(w&3) + j] >> 2s) & 3, h = w>>4, s = (w>>2)&3
     off = 16 + 32 * (w >> 4) + 8 * (w & 3)
     sh = 2 * ((w >> 2) & 3)
@@ -316,8 +390,8 @@ def _decode_q2_k(b, w, t):
     dd = b.u32(80)                                     # d, dmin in one LDS.32
     dl = _f16_bits_to_f32(dd & 0xFFFF) * cutlass.Float32(sc & 0xF)
     ml = _f16_bits_to_f32((dd >> 16) & 0xFFFF) * cutlass.Float32(sc >> 4)
-    q = (_magic_pairs((b.u32(off) >> sh) & 0x03030303)
-         + _magic_pairs((b.u32(off + 4) >> sh) & 0x03030303))
+    q = (_magic_pairs((b.u32(off) >> sh) & 0x03030303, cc)
+         + _magic_pairs((b.u32(off + 4) >> sh) & 0x03030303, cc))
     return dl, q, ml
 
 
@@ -410,8 +484,11 @@ def _chunk_size(nbytes: int, n_sb: int) -> int:
 
 
 @functools.cache
-def _make_launch(qtype: QT, n_ctas: int, chunk: int, ragged: bool):
-    """``ragged``: the row's superblock count is not a multiple of ``chunk``."""
+def _make_launch(qtype: QT, n_ctas: int, chunk: int, ragged: bool, cc: int):
+    """``ragged``: the row's superblock count is not a multiple of ``chunk``.
+    ``cc``: target compute capability (86, 120, ...), which picks the
+    instructions; below sm_100 the inner loop unpacks to float32."""
+    bf16_fma = cc >= 100
     spec = _SPECS[qtype]
     nbytes = spec.nbytes
     table_words = int(spec.table_words.size) if spec.table is not None else 0
@@ -518,15 +595,26 @@ def _make_launch(qtype: QT, n_ctas: int, chunk: int, ragged: bool):
                         valid = cutlass.Int32(s < n_sb)
                         s = _clamp_hi(s, n_sb - 1)
                     blk = _Block(views, warp, skew[0] + j * nbytes, nbytes)
-                    scale, q, ml = spec.decode(blk, lane, sT)
+                    scale, q, ml = spec.decode(blk, lane, sT, cc)
+                    if cutlass.const_expr(not bf16_fma):
+                        q = _unpack8(q)        # once, shared by all M rows of x
                     for m in cutlass.range_constexpr(M):
                         xv = cute.make_rmem_tensor(4, cutlass.Int32)
                         cute.autovec_copy(
                             cute.local_tile(gX, (1, 1, 4), (m, s, lane))[0, 0, None], xv)
                         xw = [xv[0], xv[1], xv[2], xv[3]]
-                        part = scale * _dot8(q, xw)
-                        if cutlass.const_expr(has_min):
-                            part = part - ml * _dot8([_ONES] * 4, xw)
+                        if cutlass.const_expr(bf16_fma):
+                            part = scale * _dot8(q, xw)
+                            if cutlass.const_expr(has_min):
+                                part = part - ml * _dot8([_ONES] * 4, xw)
+                        else:
+                            # unpacked per row here rather than passed in as
+                            # float32: twice the x bytes measured 25-50% slower
+                            # on a 3090, which is bound by these loads, not ALU
+                            xf = _unpack8(xw)
+                            part = scale * _dot8_f32(q, xf)
+                            if cutlass.const_expr(has_min):
+                                part = part - ml * _sum8_f32(xf)
                         if cutlass.const_expr(ragged):
                             part = _selp(valid, part, cutlass.Float32(0.0))
                         acc[m] = acc[m] + part
@@ -565,14 +653,18 @@ def _make_launch(qtype: QT, n_ctas: int, chunk: int, ragged: bool):
         # share of the rows as a serial second wave.
         kernel(gW16, gT, gX3, gO, n_rows, row_bytes, n16 - 1, n_sb, m).launch(
             grid=[n_ctas, 1, 1], block=[_CTA, 1, 1], stream=stream,
-            min_blocks_per_mp=_CTAS_PER_SM)
+            min_blocks_per_mp=_ctas_per_sm(cc))
 
     return launch
 
 
+def _ctas_per_sm(cc: int) -> int:
+    return _CTAS_PER_SM if cc >= 100 else _CTAS_PER_SM_SM80
+
+
 @functools.cache
-def _n_ctas() -> int:
-    return jax.devices()[0].core_count * _CTAS_PER_SM
+def _n_ctas(cc: int) -> int:
+    return jax.devices()[0].core_count * _ctas_per_sm(cc)
 
 
 def _table(qtype: QT) -> jax.Array:
@@ -606,9 +698,10 @@ def matmul_lowbit(x: jax.Array, w) -> jax.Array:
     if m <= _GEMV_MAX_M:
         n_sb = k_dim // QK_K
         chunk = _chunk_size(_SPECS[w.qtype].nbytes, n_sb)
-        n_ctas = min(_n_ctas(), -(-n_rows // _ROWS_PER_CTA))
+        cc = _cc()
+        n_ctas = min(_n_ctas(cc), -(-n_rows // _ROWS_PER_CTA))
         out = cutejax.call(
-            _make_launch(w.qtype, n_ctas, chunk, n_sb % chunk != 0),
+            _make_launch(w.qtype, n_ctas, chunk, n_sb % chunk != 0, cc),
             jax.ShapeDtypeStruct((m, n_rows), jnp.bfloat16),
             w.data.reshape(n_rows, -1), _table(w.qtype), xm,
             in_specs=[None, None, cutejax.ArraySpec(static_dims=(0,))],
