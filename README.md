@@ -68,9 +68,13 @@ Everything the gguf-py reference can dequantize:
   dispatching over the available kernels. Prefer this to calling a
   `gguf_jax.cute.matmul_*` directly: above their batch range those fall back
   internally to dequantizing the *whole* weight, which is the allocation you
-  were trying to avoid, whereas `matmul` blocks it instead.
+  were trying to avoid, whereas `matmul` blocks it instead. Differentiable in
+  `x` on every route (the `cute` kernels alone are not): the backward decodes
+  the weight again, in the same row blocks, so only the quantized weight is
+  saved for it. That is what `jax.remat` around the call would buy, without
+  recomputing the forward. `w` is treated as frozen and gets no gradient.
 - `dequant_matmul(x, w, block_bytes=None)` — the fallback on its own, for
-  benchmarking against the fused path.
+  benchmarking against the fused path. Same backward as `matmul`.
 - `fused_types()` / `fused_batch_limit(w)` — which qtypes have a fused kernel
   in this installation, and the largest batch `w` can be multiplied at without
   being materialized (0 if none applies).

@@ -15,6 +15,11 @@ one's batch cap is. :func:`matmul` decides.
 
 Getting the fallback right matters more than it looks. See
 :func:`dequant_matmul` for the scheduling hazard it exists to avoid.
+
+Both entry points are differentiable in ``x`` through one custom VJP, whichever
+route the forward took: the fused kernels are FFI calls with no differentiation
+rule of their own, and plain autodiff of the fallback would keep every dense
+row block alive as a residual. The backward decodes the weight again instead.
 """
 from __future__ import annotations
 
@@ -99,6 +104,9 @@ def matmul(x: jax.Array, w: QuantizedArray, *, block_bytes: int | None = None,
     kernels fall back internally to dequantizing the *whole* weight, so this
     can allocate a great deal. ``block_bytes`` overrides
     :data:`DEQUANT_BLOCK_BYTES` for this call.
+
+    Differentiable in ``x`` (reverse mode) on every route: see
+    :func:`dequant_matmul`. No gradient flows to ``w``.
     """
     if not isinstance(w, QuantizedArray):
         raise TypeError(f"expected a QuantizedArray weight, got {type(w).__name__}")
@@ -108,12 +116,13 @@ def matmul(x: jax.Array, w: QuantizedArray, *, block_bytes: int | None = None,
         raise ValueError(
             f"contraction mismatch: x has {x.shape[-1]}, w has {w.shape[1]}")
 
+    kernel = None
     entry = _fused().get(w.qtype)
     if entry is not None and x.dtype == jnp.bfloat16:
         batch = int(np.prod(x.shape[:-1], dtype=np.int64))
         if force_fused or batch <= entry[1](w):
-            return entry[0](x, w)
-    return dequant_matmul(x, w, block_bytes=block_bytes)
+            kernel = entry[0]
+    return _frozen_matmul(x, w, kernel, _blocks(w, block_bytes), x.dtype)
 
 
 def dequant_matmul(x: jax.Array, w: QuantizedArray, *,
@@ -140,11 +149,51 @@ def dequant_matmul(x: jax.Array, w: QuantizedArray, *,
     into the output in place. Stacking the blocks and transposing instead would
     be shorter, but it materializes the result twice and the transpose is large
     enough that XLA fails to find a config for it.
-    """
-    out_rows, in_features = w.shape
-    blocks = _block_count(out_rows, in_features,
-                          DEQUANT_BLOCK_BYTES if block_bytes is None else block_bytes)
 
+    **In the backward.** Differentiating that loop the ordinary way saves every
+    dense row block for the backward pass, i.e. the whole dense weight, per
+    layer. So the gradient is a custom VJP: ``dx = g @ w`` re-decodes the
+    weight in the same row blocks, behind the same barrier (with ``g`` now), and
+    the only residual is the quantized weight -- what ``jax.remat`` around the
+    call would buy, without recomputing the forward. Row blocks partition the
+    contraction here, so their products are summed in float32. No gradient
+    flows to ``w``, which is treated as frozen.
+    """
+    return _frozen_matmul(x, w, None, _blocks(w, block_bytes), x.dtype)
+
+
+def _blocks(w: QuantizedArray, block_bytes: int | None) -> int:
+    return _block_count(*w.shape,
+                        DEQUANT_BLOCK_BYTES if block_bytes is None else block_bytes)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4))
+def _frozen_matmul(x: jax.Array, w: QuantizedArray, kernel: Callable | None,
+                   blocks: int, x_dtype: Any) -> jax.Array:
+    """``x @ w.T`` by ``kernel``, or by dequantizing in ``blocks`` if None.
+
+    ``x_dtype`` is ``x.dtype``, static so the backward can give the cotangent
+    the primal's dtype: the output's may differ (an f16 ``x`` against a bf16
+    weight promotes to f32), and JAX does not check.
+    """
+    if kernel is not None:
+        return kernel(x, w)
+    return _dequant_forward(x, w, blocks)
+
+
+def _frozen_matmul_fwd(x, w, kernel, blocks, x_dtype):
+    return _frozen_matmul(x, w, kernel, blocks, x_dtype), w
+
+
+def _frozen_matmul_bwd(kernel, blocks, x_dtype, w, g):
+    return _dequant_backward(g, w, blocks).astype(x_dtype), None
+
+
+_frozen_matmul.defvjp(_frozen_matmul_fwd, _frozen_matmul_bwd)
+
+
+def _dequant_forward(x: jax.Array, w: QuantizedArray, blocks: int) -> jax.Array:
+    out_rows, in_features = w.shape
     data, x = jax.lax.optimization_barrier((w.data, x))
     w = QuantizedArray(data=data, qtype=w.qtype, shape=w.shape, dtype=w.dtype)
 
@@ -166,6 +215,33 @@ def dequant_matmul(x: jax.Array, w: QuantizedArray, *,
 
     out = jax.lax.fori_loop(0, blocks, body, out)
     return out.reshape(*x.shape[:-1], out_rows)
+
+
+def _dequant_backward(g: jax.Array, w: QuantizedArray, blocks: int) -> jax.Array:
+    """``g @ w``, the cotangent of ``x``, decoding ``w`` as the forward did."""
+    out_rows, in_features = w.shape
+    data, g = jax.lax.optimization_barrier((w.data, g))
+    w = QuantizedArray(data=data, qtype=w.qtype, shape=w.shape, dtype=w.dtype)
+
+    if blocks == 1:
+        return g @ w.dequantize()
+
+    rows = out_rows // blocks
+    flat = g.reshape(-1, out_rows)
+    data = w.data.reshape(blocks, rows, -1)
+
+    def body(i, acc):
+        sub = QuantizedArray(
+            data=jax.lax.dynamic_index_in_dim(data, i, keepdims=False),
+            qtype=w.qtype, shape=(rows, in_features), dtype=w.dtype,
+        )
+        g_rows = jax.lax.dynamic_slice_in_dim(flat, i * rows, rows, axis=1)
+        return acc + jnp.matmul(g_rows, sub.dequantize(),
+                                preferred_element_type=jnp.float32)
+
+    acc = jnp.zeros((flat.shape[0], in_features), jnp.float32)
+    acc = jax.lax.fori_loop(0, blocks, body, acc)
+    return acc.reshape(*g.shape[:-1], in_features)
 
 
 def _block_count(out_rows: int, in_features: int, budget: int) -> int:

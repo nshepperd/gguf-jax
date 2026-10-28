@@ -102,6 +102,66 @@ def test_batched_leading_dims_are_preserved():
     assert mm.matmul(x, w).shape == (2, 3, 128)
 
 
+# --- gradients --------------------------------------------------------------
+
+def grad_x(f, x, g):
+    """The cotangent of ``x`` for output cotangent ``g``."""
+    _, vjp = jax.vjp(f, x)
+    return vjp(g)[0]
+
+
+def grad_reference(g, w):
+    wd = np.asarray(w.dequantize(jnp.bfloat16), dtype=np.float64)
+    return np.asarray(g, dtype=np.float64) @ wd
+
+
+def test_grad_matches_plain_autodiff_bitwise():
+    """Unblocked, the custom backward is exactly what autodiff would compute."""
+    w = make_weight(128, 512, QT.Q4_K, seed=11)
+    rng = np.random.default_rng(11)
+    x = jnp.asarray(rng.normal(size=(2, 3, 512)), jnp.bfloat16)
+    g = jnp.asarray(rng.normal(size=(2, 3, 128)), jnp.bfloat16)
+    got = grad_x(lambda x: mm.dequant_matmul(x, w), x, g)
+    plain = grad_x(lambda x: x @ w.dequantize().T, x, g)
+    assert got.dtype == x.dtype and got.shape == x.shape
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(plain).view(np.uint16))
+
+
+def test_blocked_grad_matches_reference():
+    w = make_weight(256, 512, QT.Q4_K, seed=12)
+    rng = np.random.default_rng(12)
+    x = jnp.asarray(rng.normal(size=(4, 512)), jnp.bfloat16)
+    g = jnp.asarray(rng.normal(size=(4, 256)), jnp.bfloat16)
+    ref = grad_reference(g, w)
+    for budget in (1 << 30, 1 << 18, 1 << 16):
+        got = grad_x(lambda x, b=budget: mm.dequant_matmul(x, w, block_bytes=b), x, g)
+        np.testing.assert_allclose(
+            np.asarray(got, dtype=np.float64), ref, rtol=2e-2,
+            atol=1e-2 * np.abs(ref).max(), err_msg=f"block_bytes={budget}")
+
+
+def test_grad_has_the_dtype_of_x():
+    """An f16 x against a bf16 weight promotes the output to f32; dx stays f16."""
+    w = make_weight(128, 512, QT.Q4_K, seed=13)
+    x = jnp.ones((2, 512), jnp.float16)
+    dx = jax.grad(lambda x: mm.matmul(x, w).sum())(x)
+    assert dx.dtype == jnp.float16
+
+
+def test_backward_keeps_no_dense_weight():
+    """The residuals are the quantized bytes, not a decoded copy of them."""
+    from jax._src.ad_checkpoint import saved_residuals
+
+    w = make_weight(256, 512, QT.Q4_K, seed=14)
+    x = jnp.ones((4, 512), jnp.bfloat16)
+    for budget in (1 << 30, 1 << 16):
+        res = saved_residuals(
+            lambda x, w, b=budget: mm.dequant_matmul(x, w, block_bytes=b).sum(), x, w)
+        floats = [a for a, _ in res if jnp.issubdtype(a.dtype, jnp.floating)]
+        assert all(a.size < 256 * 512 // 16 for a in floats), (budget, res)
+
+
 # --- dispatch, needs the cute kernels -------------------------------------
 
 pytestmark_gpu = pytest.mark.skipif(
@@ -127,6 +187,23 @@ def test_fused_agrees_with_fallback(qtype):
         np.testing.assert_allclose(
             got, ref, rtol=2e-2, atol=2e-2 * np.abs(ref).max(),
             err_msg=f"{qtype.name} at M={m}")
+
+
+@pytestmark_gpu
+@pytest.mark.parametrize("qtype", FUSED, ids=lambda t: t.name)
+def test_fused_route_is_differentiable(qtype):
+    """The kernels are FFI calls with no VJP; matmul's must cover them."""
+    pytest.importorskip("gguf_jax.cute")
+    w = make_weight(256, 512, qtype, seed=hash(qtype) % 1000)
+    assert mm.fused_batch_limit(w) >= 2
+    rng = np.random.default_rng(15)
+    x = jnp.asarray(rng.normal(size=(2, 512)), jnp.bfloat16)
+    g = jnp.asarray(rng.normal(size=(2, 256)), jnp.bfloat16)
+    got = jax.jit(lambda x, g: grad_x(lambda x: mm.matmul(x, w), x, g))(x, g)
+    ref = grad_reference(g, w)
+    np.testing.assert_allclose(
+        np.asarray(got, dtype=np.float64), ref, rtol=2e-2,
+        atol=1e-2 * np.abs(ref).max(), err_msg=qtype.name)
 
 
 @pytestmark_gpu
